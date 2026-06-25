@@ -145,17 +145,6 @@ export function getWebviewContent(): string {
       box-shadow: 0 4px 20px rgba(0, 255, 102, 0.05);
     }
 
-    .status-card {
-      margin-top: auto;
-      background: rgba(255, 255, 255, 0.02);
-      border: 1px solid var(--border-color);
-      border-radius: 12px;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-
     .status-header {
       display: flex;
       align-items: center;
@@ -171,7 +160,6 @@ export function getWebviewContent(): string {
       background-color: var(--color-primary);
       border-radius: 50%;
       box-shadow: 0 0 10px var(--color-primary);
-      animation: pulse 2s infinite;
     }
 
     .status-value {
@@ -221,6 +209,15 @@ export function getWebviewContent(): string {
       grid-template-columns: repeat(4, 1fr);
       gap: 20px;
       margin-bottom: 32px;
+    }
+
+    @media (max-width: 900px) {
+      .metrics-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+      .dashboard-sections {
+        grid-template-columns: 1fr !important;
+      }
     }
 
     .metric-card {
@@ -592,9 +589,21 @@ export function getWebviewContent(): string {
       border: 1px solid var(--border-color);
       border-radius: 16px;
       padding: 32px;
-      display: flex;
+      display: none;
       flex-direction: column;
       gap: 24px;
+    }
+
+    .policy-editor-panel.visible {
+      display: flex;
+    }
+
+    .cell-truncate {
+      max-width: 300px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      cursor: help;
     }
 
     .form-group {
@@ -709,6 +718,21 @@ export function getWebviewContent(): string {
     }
 
     /* Modal / Drawer inspect panel */
+    .drawer-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      z-index: 99;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s ease;
+    }
+
+    .drawer-backdrop.open {
+      opacity: 1;
+      pointer-events: all;
+    }
+
     .drawer {
       position: fixed;
       top: 0;
@@ -811,6 +835,39 @@ export function getWebviewContent(): string {
         box-shadow: 0 0 0 0 rgba(0, 255, 102, 0);
       }
     }
+
+    @keyframes shimmer {
+      0% { background-position: -200% center; }
+      100% { background-position: 200% center; }
+    }
+
+    .status-indicator {
+      animation: pulse 2s infinite;
+      flex-shrink: 0;
+    }
+
+    .status-card {
+      margin-top: auto;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .status-card::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(105deg, transparent 40%, rgba(255,255,255,0.03) 50%, transparent 60%);
+      background-size: 200% 100%;
+      animation: shimmer 3s linear infinite;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -842,7 +899,7 @@ export function getWebviewContent(): string {
         </li>
         <li class="menu-item" onclick="switchTab('configs')">
           <svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-          Shield Assistant
+          Configs
         </li>
       </ul>
       
@@ -1000,7 +1057,7 @@ export function getWebviewContent(): string {
             <!-- Populated dynamically -->
           </div>
 
-          <div class="policy-editor-panel" id="policy-editor" style="display: none;">
+          <div class="policy-editor-panel" id="policy-editor">
             <h3 class="section-title" id="policy-editor-title" style="font-size: 18px;">Edit Server Policy</h3>
             
             <div class="form-group">
@@ -1060,7 +1117,7 @@ export function getWebviewContent(): string {
             </div>
           </div>
 
-          <div class="policy-editor-panel" id="policy-editor-placeholder" style="justify-content: center; align-items: center; text-align: center; color: var(--text-muted);">
+          <div class="policy-editor-panel visible" id="policy-editor-placeholder" style="justify-content: center; align-items: center; text-align: center; color: var(--text-muted);">
             <svg style="width: 48px; height: 48px; margin-bottom: 16px; opacity: 0.5;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
             Select an MCP Server from the left list to edit its security policy.
           </div>
@@ -1082,6 +1139,9 @@ export function getWebviewContent(): string {
       </div>
     </div>
   </div>
+
+  <!-- Drawer Backdrop -->
+  <div class="drawer-backdrop" id="drawer-backdrop" onclick="closeDrawer()"></div>
 
   <!-- Detail Drawer -->
   <div class="drawer" id="inspect-drawer">
@@ -1301,7 +1361,7 @@ export function getWebviewContent(): string {
             '<td style="font-weight: 500;">' + log.server_id + '</td>' +
             '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + log.tool_name + '</td>' +
             '<td><span class="badge ' + badgeClass + '">' + log.decision + '</span></td>' +
-            '<td style="font-size: 12px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">' + log.reason + '</td>';
+            '<td><span class="cell-truncate" title="' + log.reason.replace(/"/g, '&quot;') + '">' + log.reason + '</span></td>';
           
           tbody.appendChild(tr);
         });
@@ -1325,7 +1385,7 @@ export function getWebviewContent(): string {
             '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + warn.tool_name + '</td>' +
             '<td><span class="badge badge-warning">' + warn.smell_type + '</span></td>' +
             '<td style="font-size: 12px; color: var(--text-muted);">' + warn.details + '</td>' +
-            '<td><span class="badge badge-success">SANITIZED</span></td>';
+            '<td><span class="badge ' + (warn.sanitized ? 'badge-success">SANITIZED' : 'badge-warning">DETECTED') + '</span></td>';
           
           tbody.appendChild(tr);
         });
@@ -1362,9 +1422,8 @@ export function getWebviewContent(): string {
       renderPolicies();
 
       // Show editor
-      document.getElementById('policy-editor-placeholder').style.display = 'none';
-      const editor = document.getElementById('policy-editor');
-      editor.style.display = 'flex';
+      document.getElementById('policy-editor-placeholder').classList.remove('visible');
+      document.getElementById('policy-editor').classList.add('visible');
       
       document.getElementById('policy-editor-title').innerText = 'Edit Policy: ' + serverId;
 
@@ -1440,7 +1499,12 @@ export function getWebviewContent(): string {
       listContainer.innerHTML = '';
 
       if (globalConfigs.length === 0) {
-        listContainer.innerHTML = '<div class="section-card" style="text-align: center; padding: 32px; color: var(--text-muted);">No MCP Configuration files detected in standard app storage directories.</div>';
+        listContainer.innerHTML = 
+          '<div class="section-card" style="text-align: center; padding: 48px 32px; color: var(--text-muted);">' +
+            '<svg style="width:48px;height:48px;margin:0 auto 16px;display:block;opacity:0.35;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>' +
+            '<div style="font-size:15px;font-weight:600;color:var(--text-main);margin-bottom:8px;">No MCP Configs Found</div>' +
+            '<div style="font-size:13px;max-width:360px;margin:0 auto;line-height:1.6;">No MCP configuration files were detected in standard app storage directories. Click <strong style="color:var(--text-main);">Rescan Configs</strong> to search again.</div>' +
+          '</div>';
         return;
       }
 
@@ -1532,10 +1596,14 @@ export function getWebviewContent(): string {
       }
 
       document.getElementById('inspect-drawer').classList.add('open');
+      document.getElementById('drawer-backdrop').classList.add('open');
+      document.body.style.overflow = 'hidden';
     }
 
     function closeDrawer() {
       document.getElementById('inspect-drawer').classList.remove('open');
+      document.getElementById('drawer-backdrop').classList.remove('open');
+      document.body.style.overflow = '';
     }
 
     // Helper functions
