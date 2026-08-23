@@ -907,23 +907,23 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       </div>
       
       <ul class="menu-list">
-        <li class="menu-item active" onclick="switchTab('dashboard')">
+        <li class="menu-item active" data-action="tab" data-tab="dashboard">
           <svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2H6a2 2 0 01-2-2v-4zM14 16a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2h-2a2 2 0 01-2-2v-4z"></path></svg>
           Dashboard
         </li>
-        <li class="menu-item" onclick="switchTab('audit')">
+        <li class="menu-item" data-action="tab" data-tab="audit">
           <svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
           Audit Logs
         </li>
-        <li class="menu-item" onclick="switchTab('warnings')">
+        <li class="menu-item" data-action="tab" data-tab="warnings">
           <svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
           Security Warnings
         </li>
-        <li class="menu-item" onclick="switchTab('policies')">
+        <li class="menu-item" data-action="tab" data-tab="policies">
           <svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>
           Policies
         </li>
-        <li class="menu-item" onclick="switchTab('configs')">
+        <li class="menu-item" data-action="tab" data-tab="configs">
           <svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
           Configs
         </li>
@@ -969,7 +969,7 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
           <div class="section-card">
             <div class="section-header">
               <span class="section-title">Recent Activity Logs</span>
-              <span class="view-all-btn" onclick="switchTab('audit')">View all</span>
+              <span class="view-all-btn" data-action="tab" data-tab="audit">View all</span>
             </div>
             <div class="table-container">
               <table>
@@ -993,7 +993,7 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
           <div class="section-card">
             <div class="section-header">
               <span class="section-title">Latest Security Smells</span>
-              <span class="view-all-btn" onclick="switchTab('warnings')">View all</span>
+              <span class="view-all-btn" data-action="tab" data-tab="warnings">View all</span>
             </div>
             <div class="table-container">
               <table>
@@ -1018,11 +1018,11 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       <!-- Tab: Audit Logs -->
       <div id="pane-audit" class="view-pane">
         <div class="filter-toolbar">
-          <input type="text" class="search-input" id="log-search" placeholder="Search by tool, args, or reasons..." oninput="filterLogs()">
-          <select class="select-input" id="log-server-filter" onchange="filterLogs()">
+          <input type="text" class="search-input" id="log-search" placeholder="Search by tool, args, or reasons..." data-action="filter">
+          <select class="select-input" id="log-server-filter" data-action="filter">
             <option value="">All Servers</option>
           </select>
-          <select class="select-input" id="log-status-filter" onchange="filterLogs()">
+          <select class="select-input" id="log-status-filter" data-action="filter">
             <option value="">All Decisions</option>
             <option value="ALLOWED">Allowed</option>
             <option value="BLOCKED">Blocked</option>
@@ -1139,7 +1139,7 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
             </div>
 
             <div style="display: flex; gap: 12px; margin-top: 12px;">
-              <button class="btn btn-primary" onclick="saveActivePolicy()">Save Policy</button>
+              <button class="btn btn-primary" data-action="save-policy">Save Policy</button>
             </div>
           </div>
 
@@ -1153,7 +1153,7 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       <!-- Tab: Config Assistant -->
       <div id="pane-configs" class="view-pane">
         <div class="filter-toolbar" style="justify-content: flex-end;">
-          <button class="btn btn-outline" onclick="triggerScan()">
+          <button class="btn btn-outline" data-action="rescan">
             <svg style="width: 14px; height: 14px;" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H17m0 0V4m0 4h4"></path></svg>
             Rescan Configs
           </button>
@@ -1167,13 +1167,13 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
   </div>
 
   <!-- Drawer Backdrop -->
-  <div class="drawer-backdrop" id="drawer-backdrop" onclick="closeDrawer()"></div>
+  <div class="drawer-backdrop" id="drawer-backdrop" data-action="close-drawer"></div>
 
   <!-- Detail Drawer -->
   <div class="drawer" id="inspect-drawer">
     <div class="drawer-header">
       <span class="drawer-title" id="drawer-title">Inspect Tool Call</span>
-      <button class="close-btn" onclick="closeDrawer()">&times;</button>
+      <button class="close-btn" data-action="close-drawer">&times;</button>
     </div>
     <div class="drawer-body">
       <div class="info-card">
@@ -1203,15 +1203,42 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
     </div>
   </div>
 
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    
+
+    /**
+     * Escape a value for safe insertion into HTML.
+     *
+     * Everything rendered below originates from an MCP server we explicitly do
+     * not trust, so this is applied to every interpolated value — not just the
+     * ones that look risky. Ampersand must be replaced first or it would
+     * double-escape the entities introduced afterwards.
+     */
+    function esc(value) {
+      return String(value === null || value === undefined ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    /** Risk score (0-100) to a CSS colour variable. */
+    function riskColor(score) {
+      if (score >= 100) return 'var(--color-danger)';
+      if (score >= 75) return 'var(--color-danger)';
+      if (score >= 45) return 'var(--color-warning)';
+      if (score > 0) return 'var(--color-accent)';
+      return 'var(--text-muted)';
+    }
+
     // Global memory store
     let globalLogs = [];
     let globalWarnings = [];
     let globalPolicies = [];
     let globalConfigs = [];
-    
+    let globalRules = [];
+
     let activeServerIdForPolicy = null;
 
     // Handle messages from VS Code extension
@@ -1222,12 +1249,73 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
         globalWarnings = message.warnings || [];
         globalPolicies = message.policies || [];
         globalConfigs = message.configs || [];
-        
+        globalRules = message.rules || [];
+
         renderDashboard();
         renderAuditLogs();
         renderWarnings();
         renderPolicies();
         renderConfigs();
+      }
+    });
+
+    /**
+     * Single delegated click handler.
+     *
+     * The CSP restricts script-src to a nonce, which disallows inline `onclick`
+     * attributes. Rather than attach a listener per element, elements declare
+     * their intent with `data-action` and this resolves it. Handles dynamically
+     * created rows too, since the listener is on the document.
+     */
+    document.addEventListener('click', (event) => {
+      const target = event.target instanceof Element
+        ? event.target.closest('[data-action]')
+        : null;
+      if (!target) return;
+
+      switch (target.getAttribute('data-action')) {
+        case 'tab':
+          switchTab(target.getAttribute('data-tab'));
+          break;
+        case 'save-policy':
+          saveActivePolicy();
+          break;
+        case 'rescan':
+          triggerScan();
+          break;
+        case 'close-drawer':
+          closeDrawer();
+          break;
+        case 'toggle-shield':
+          // Values arrive as attributes rather than interpolated into a JS
+          // string, so a server id containing a quote cannot break out and
+          // execute. The original built an onclick attribute by concatenation.
+          toggleShield(
+            target.getAttribute('data-config-path'),
+            target.getAttribute('data-server-id'),
+            target.getAttribute('data-shield') === 'true'
+          );
+          break;
+        case 'revoke-rule':
+          revokeRule(
+            target.getAttribute('data-server-id'),
+            target.getAttribute('data-tool-name')
+          );
+          break;
+      }
+    });
+
+    // Search and filter inputs.
+    document.addEventListener('input', (event) => {
+      const el = event.target;
+      if (el instanceof Element && el.getAttribute('data-action') === 'filter') {
+        filterLogs();
+      }
+    });
+    document.addEventListener('change', (event) => {
+      const el = event.target;
+      if (el instanceof Element && el.getAttribute('data-action') === 'filter') {
+        filterLogs();
       }
     });
 
@@ -1242,10 +1330,11 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       if (pane) {
         pane.classList.add('active');
         
-        // Find matching menu item and highlight
+        // Highlight the matching menu item. Reads data-tab rather than parsing
+        // the old onclick attribute, which no longer exists under the CSP.
         const menuItems = document.querySelectorAll('.menu-item');
         for (const item of menuItems) {
-          if (item.getAttribute('onclick').includes(tabId)) {
+          if (item.getAttribute('data-tab') === tabId) {
             item.classList.add('active');
             break;
           }
@@ -1307,13 +1396,13 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
           tr.onclick = () => openInspectDrawer(log);
           
           const badgeClass = log.decision === 'ALLOWED' ? 'badge-success' : 'badge-danger';
-          
-          tr.innerHTML = 
-            '<td style="color: var(--text-muted);">' + formatTime(log.timestamp) + '</td>' +
-            '<td style="font-weight: 500;">' + log.server_id + '</td>' +
-            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + log.tool_name + '</td>' +
-            '<td><span class="badge ' + badgeClass + '">' + log.decision + '</span></td>';
-          
+
+          tr.innerHTML =
+            '<td style="color: var(--text-muted);">' + esc(formatTime(log.timestamp)) + '</td>' +
+            '<td style="font-weight: 500;">' + esc(log.server_id) + '</td>' +
+            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + esc(log.tool_name) + '</td>' +
+            '<td><span class="badge ' + badgeClass + '">' + esc(log.decision) + '</span></td>';
+
           tbodyLogs.appendChild(tr);
         });
       }
@@ -1326,10 +1415,10 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       } else {
         globalWarnings.slice(0, 5).forEach(warn => {
           const tr = document.createElement('tr');
-          tr.innerHTML = 
-            '<td style="font-weight: 500;">' + warn.server_id + '</td>' +
-            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + warn.tool_name + '</td>' +
-            '<td style="color: var(--color-danger); font-size: 12px;">' + warn.details + '</td>';
+          tr.innerHTML =
+            '<td style="font-weight: 500;">' + esc(warn.server_id) + '</td>' +
+            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + esc(warn.tool_name) + '</td>' +
+            '<td style="color: var(--color-danger); font-size: 12px;">' + esc(warn.details) + '</td>';
           tbodyWarnings.appendChild(tr);
         });
       }
@@ -1373,7 +1462,7 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       });
 
       if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No matching logs found.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 24px;">No matching logs found.</td></tr>';
       } else {
         filtered.forEach(log => {
           const tr = document.createElement('tr');
@@ -1381,14 +1470,16 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
           tr.onclick = () => openInspectDrawer(log);
 
           const badgeClass = log.decision === 'ALLOWED' ? 'badge-success' : 'badge-danger';
-          
-          tr.innerHTML = 
-            '<td style="color: var(--text-muted);">' + formatTime(log.timestamp) + '</td>' +
-            '<td style="font-weight: 500;">' + log.server_id + '</td>' +
-            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + log.tool_name + '</td>' +
-            '<td><span class="badge ' + badgeClass + '">' + log.decision + '</span></td>' +
-            '<td><span class="cell-truncate" title="' + log.reason.replace(/"/g, '&quot;') + '">' + log.reason + '</span></td>';
-          
+          const score = Number(log.risk_score) || 0;
+
+          tr.innerHTML =
+            '<td style="color: var(--text-muted);">' + esc(formatTime(log.timestamp)) + '</td>' +
+            '<td style="font-weight: 500;">' + esc(log.server_id) + '</td>' +
+            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + esc(log.tool_name) + '</td>' +
+            '<td><span class="badge ' + badgeClass + '">' + esc(log.decision) + '</span></td>' +
+            '<td style="font-weight: 600; color: ' + riskColor(score) + ';">' + (score > 0 ? esc(score) : '—') + '</td>' +
+            '<td><span class="cell-truncate" title="' + esc(log.reason) + '">' + esc(log.reason) + '</span></td>';
+
           tbody.appendChild(tr);
         });
       }
