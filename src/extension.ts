@@ -1,34 +1,95 @@
+/**
+ * MCP Shield — VS Code Extension Host
+ * ===================================
+ *
+ * Responsibilities, in order of importance:
+ *
+ *   1. Own the SQLite database that the out-of-process proxies read policy from
+ *      and write audit records to.
+ *   2. Run the IPC server that answers approval requests from those proxies.
+ *   3. Discover MCP client configuration files and rewrite them to insert or
+ *      remove the shield.
+ *   4. Supervise HTTP proxy child processes (stdio proxies are spawned by the
+ *      MCP client itself, so they need no supervision here).
+ *   5. Render the dashboard.
+ *
+ * The extension is *not* in the data path for stdio servers. That is deliberate:
+ * if VS Code is closed, a shielded stdio server still gets policy enforcement,
+ * because the proxy reads the same database directly. What is lost without
+ * VS Code running is the interactive prompt — and in that case a gated call
+ * fails closed after the approval timeout rather than being waved through.
+ */
+
 import * as vscode from "vscode";
-import * as path from "path";
 import * as fs from "fs";
+import * as path from "path";
 import * as net from "net";
-import { getSocketPath, ApprovalRequest, ApprovalResponse } from "./ipc";
+import * as crypto from "crypto";
+import { spawn, ChildProcess } from "child_process";
 import {
   openDB,
-  getPolicy,
-  savePolicy,
-  getAllPolicies,
   getAuditLogs,
   getWarnings,
-  getActivePendingApprovals,
+  getAllPolicies,
+  savePolicy,
   updateApprovalStatus,
-  Policy,
+  getActivePendingApprovals,
+  saveApprovalRule,
+  getApprovalRules,
+  deleteApprovalRule,
+  clearSessionApprovalRules,
+  clearAllPendingApprovals,
 } from "./database";
+import { getSocketPath, ApprovalRequest, ApprovalResponse } from "./ipc";
 import { getWebviewContent } from "./webview";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Module state
+// ─────────────────────────────────────────────────────────────────────────────
+
 let dbInstance: any = null;
+let dbPathGlobal = "";
 let approvalInterval: NodeJS.Timeout | null = null;
-const activePrompts = new Set<string>();
 let ipcServer: net.Server | null = null;
 let activeSocketPath: string | null = null;
+let statusBarItem: vscode.StatusBarItem | null = null;
+let treeProvider: ShieldTreeProvider | null = null;
+let outputChannel: vscode.OutputChannel | null = null;
+
+/**
+ * Approval ids currently showing a modal, so the same request is not prompted
+ * twice by the IPC handler and the polling fallback simultaneously.
+ */
+const activePrompts = new Set<string>();
+
+/** Running HTTP proxy children, keyed by `${configPath}::${serverId}`. */
+const httpProxies = new Map<string, ChildProcess>();
+
+/**
+ * How long a pending row must sit unclaimed before the polling fallback offers
+ * it to the user.
+ *
+ * This fixes a race in the original design. Both the IPC handler and a 1-second
+ * poller raised the same modal; whichever won inserted the id into
+ * `activePrompts`, and if the poller won, the IPC handler returned early
+ * *without writing a socket response*. The proxy then waited out its full
+ * 90-second timeout even though the user had already clicked Allow. Giving IPC a
+ * head start means the push path handles everything it can, and polling only
+ * picks up genuinely orphaned rows.
+ */
+const POLL_GRACE_MS = 2500;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Activation
+// ─────────────────────────────────────────────────────────────────────────────
 
 export async function activate(context: vscode.ExtensionContext) {
-  console.log('MCP Shield extension is now active!');
+  outputChannel = vscode.window.createOutputChannel("MCP Shield");
+  context.subscriptions.push(outputChannel);
 
-  // Determine database path
   const dbPath = getDatabasePath(context);
-  
-  // Ensure the directory for the database exists
+  dbPathGlobal = dbPath;
+
   const dbDir = path.dirname(dbPath);
   if (!fs.existsSync(dbDir)) {
     fs.mkdirSync(dbDir, { recursive: true });
@@ -36,635 +97,363 @@ export async function activate(context: vscode.ExtensionContext) {
 
   try {
     dbInstance = await openDB(dbPath);
+    // Session-scoped approvals must not survive a window reload, or "allow for
+    // this session" would quietly become "allow forever".
+    await clearSessionApprovalRules(dbInstance);
+    // Any pending row here is a leftover from a proxy that died mid-prompt.
+    await clearAllPendingApprovals(dbInstance);
     startIpcServer(dbPath, dbInstance);
   } catch (err: any) {
-    vscode.window.showErrorMessage(`MCP Shield: Failed to initialize SQLite database: ${err.message}`);
+    vscode.window.showErrorMessage(
+      `MCP Shield: failed to initialize the policy database: ${err.message}`
+    );
     return;
   }
 
-  // Register commands
+  log(`Database: ${dbPath}`);
+  log(`IPC channel: ${getSocketPath(dbPath)}`);
+
+  // ── Commands ─────────────────────────────────────────────────────────────
   context.subscriptions.push(
     vscode.commands.registerCommand("mcp-shield.openDashboard", () => {
-      DashboardPanel.createOrShow(context.extensionUri, dbPath);
-    })
-  );
-
-  context.subscriptions.push(
+      DashboardPanel.createOrShow(context, dbPath);
+    }),
     vscode.commands.registerCommand("mcp-shield.scanConfigs", async () => {
-      const configs = scanMcpConfigs(context, dbPath);
-      vscode.window.showInformationMessage(
-        `MCP Shield scan complete. Found ${configs.length} MCP configurations.`
+      const configs = scanMcpConfigs(context);
+      const serverCount = configs.reduce((n, c) => n + c.servers.length, 0);
+      const shieldedCount = configs.reduce(
+        (n, c) => n + c.servers.filter((s) => s.isShielded).length,
+        0
       );
-      DashboardPanel.createOrShow(context.extensionUri, dbPath);
+      vscode.window.showInformationMessage(
+        `MCP Shield: found ${configs.length} config file(s), ${serverCount} server(s), ${shieldedCount} shielded.`
+      );
+      treeProvider?.refresh();
+      DashboardPanel.createOrShow(context, dbPath);
+    }),
+    vscode.commands.registerCommand("mcp-shield.runAttackDemo", () =>
+      runAttackDemo(context, dbPath)
+    ),
+    vscode.commands.registerCommand("mcp-shield.revokeAllRules", async () => {
+      const rules = await getApprovalRules(dbInstance);
+      for (const rule of rules) {
+        await deleteApprovalRule(dbInstance, rule.server_id, rule.tool_name);
+      }
+      vscode.window.showInformationMessage(
+        `MCP Shield: revoked ${rules.length} standing approval rule(s).`
+      );
     })
   );
 
-  // Status Bar Item
-  const statusBarItem = vscode.window.createStatusBarItem(
-    vscode.StatusBarAlignment.Right,
-    100
+  // ── Tree view ────────────────────────────────────────────────────────────
+  treeProvider = new ShieldTreeProvider(context);
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider("mcp-shield-sidebar", treeProvider)
   );
-  statusBarItem.command = "mcp-shield.openDashboard";
-  statusBarItem.text = "$(shield) MCP Shield: Active";
-  statusBarItem.tooltip = "Click to open MCP Shield Security Dashboard";
-  statusBarItem.show();
-  context.subscriptions.push(statusBarItem);
 
-  // Start polling loop for pending approvals (gated tools)
+  // ── Status bar ───────────────────────────────────────────────────────────
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBarItem.command = "mcp-shield.openDashboard";
+  context.subscriptions.push(statusBarItem);
+  updateStatusBar(context);
+  statusBarItem.show();
+
+  // ── Approval fallback poll ───────────────────────────────────────────────
   approvalInterval = setInterval(() => {
-    if (dbInstance) {
-      pollPendingApprovals(dbInstance);
-    }
+    if (dbInstance) void pollPendingApprovals(dbInstance);
   }, 1000);
 
-  // Auto-scan configurations on startup
+  // ── Restore HTTP proxies for already-shielded servers ────────────────────
+  // Unlike stdio, nothing else starts these: the MCP client only knows a URL.
   setTimeout(() => {
-    scanMcpConfigs(context, dbPath);
-  }, 3000);
+    const configs = scanMcpConfigs(context);
+    for (const config of configs) {
+      for (const server of config.servers) {
+        if (server.transport === "http" && server.isShielded && server.proxyPort && server.url) {
+          startHttpProxy(context, config.path, server.id, server.url, server.proxyPort);
+        }
+      }
+    }
+    updateStatusBar(context);
+    treeProvider?.refresh();
+  }, 1500);
 }
 
 export function deactivate() {
-  if (approvalInterval) {
-    clearInterval(approvalInterval);
+  if (approvalInterval) clearInterval(approvalInterval);
+  if (ipcServer) ipcServer.close();
+
+  for (const [key, child] of httpProxies) {
+    try {
+      child.kill();
+    } catch {
+      /* already gone */
+    }
+    httpProxies.delete(key);
   }
-  if (ipcServer) {
-    ipcServer.close();
-  }
+
+  // Unix sockets leave a filesystem entry behind; Windows named pipes do not.
   if (activeSocketPath && process.platform !== "win32" && fs.existsSync(activeSocketPath)) {
     try {
       fs.unlinkSync(activeSocketPath);
-    } catch (e) {}
+    } catch {
+      /* best effort */
+    }
   }
 }
+
+function log(message: string) {
+  outputChannel?.appendLine(`[${new Date().toISOString()}] ${message}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IPC server (answers approval requests from proxy processes)
+// ─────────────────────────────────────────────────────────────────────────────
 
 function startIpcServer(dbPath: string, db: any) {
   const socketPath = getSocketPath(dbPath);
   activeSocketPath = socketPath;
 
-  // If Unix socket, remove existing file if it exists
+  // A stale socket file from a crashed window would make listen() fail with
+  // EADDRINUSE, so clear it first. Windows named pipes are cleaned up by the OS.
   if (process.platform !== "win32" && fs.existsSync(socketPath)) {
     try {
       fs.unlinkSync(socketPath);
-    } catch (e) {}
+    } catch {
+      /* fall through to the listen error handler */
+    }
   }
 
   ipcServer = net.createServer((socket) => {
     let buffer = "";
-    socket.on("data", async (chunk) => {
+    socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       let idx;
       while ((idx = buffer.indexOf("\n")) !== -1) {
         const line = buffer.substring(0, idx).trim();
         buffer = buffer.substring(idx + 1);
-        if (line) {
-          try {
-            const req = JSON.parse(line) as ApprovalRequest;
-            await handleIpcApprovalRequest(req, socket, db);
-          } catch (err) {
-            console.error("[MCP Shield Extension IPC] Error parsing request:", err);
-          }
+        if (!line) continue;
+        try {
+          const req = JSON.parse(line) as ApprovalRequest;
+          void handleIpcApprovalRequest(req, socket, db);
+        } catch (err) {
+          log(`IPC: malformed request frame ignored: ${err}`);
         }
       }
     });
 
-    socket.on("error", (err) => {
-      console.error("[MCP Shield Extension IPC] Socket error:", err);
-    });
+    socket.on("error", (err) => log(`IPC socket error: ${err.message}`));
   });
 
-  ipcServer.listen(socketPath, () => {
-    console.log(`[MCP Shield Extension IPC] Server listening on ${socketPath}`);
-  });
-
+  ipcServer.listen(socketPath, () => log("IPC server listening"));
   ipcServer.on("error", (err) => {
-    console.error("[MCP Shield Extension IPC] Server error:", err);
+    log(`IPC server error: ${err.message}`);
+    vscode.window.showWarningMessage(
+      "MCP Shield: could not open the approval channel. Gated tool calls will fall back to slower database polling."
+    );
   });
 }
 
+/**
+ * Prompt the developer and answer the proxy over the socket.
+ *
+ * Critically, this *always* writes a response — including when the request is a
+ * duplicate. The original returned early on a duplicate id without replying,
+ * leaving the proxy to wait out its 90-second timeout.
+ */
 async function handleIpcApprovalRequest(req: ApprovalRequest, socket: net.Socket, db: any) {
+  const respond = (status: "APPROVED" | "DENIED") => {
+    const res: ApprovalResponse = { id: req.id, status };
+    try {
+      if (!socket.destroyed) socket.write(JSON.stringify(res) + "\n");
+    } catch (err) {
+      log(`IPC: failed to write response: ${err}`);
+    }
+  };
+
   if (activePrompts.has(req.id)) {
+    // Already being handled elsewhere; do not raise a second modal, but do not
+    // leave the caller hanging either.
     return;
   }
-
   activePrompts.add(req.id);
 
-  let formattedArgs = "";
   try {
-    formattedArgs = JSON.stringify(JSON.parse(req.arguments), null, 2);
-  } catch {
-    formattedArgs = req.arguments;
-  }
-
-  const detailMessage = `Server: ${req.serverId}\nTool: ${req.toolName}\n\nArguments:\n${formattedArgs}\n\nChoose 'Allow' to run this tool call, or 'Block' to prevent execution.`;
-
-  vscode.window
-    .showWarningMessage(
-      `[MCP Shield Gating] Authorization Required`,
-      {
-        modal: true,
-        detail: detailMessage,
-      },
-      "Allow",
-      "Block"
-    )
-    .then(async (selection) => {
-      let status: "APPROVED" | "DENIED" = "DENIED";
-      try {
-        if (selection === "Allow") {
-          status = "APPROVED";
-          await updateApprovalStatus(db, req.id, "APPROVED");
-          vscode.window.setStatusBarMessage(`$(check) MCP Shield: Tool call allowed`, 3000);
-        } else {
-          status = "DENIED";
-          await updateApprovalStatus(db, req.id, "DENIED");
-          vscode.window.setStatusBarMessage(`$(x) MCP Shield: Tool call blocked`, 3000);
-        }
-      } catch (err: any) {
-        console.error(`Failed to update approval status: ${err.message}`);
-      } finally {
-        activePrompts.delete(req.id);
-        const res: ApprovalResponse = { id: req.id, status };
-        try {
-          socket.write(JSON.stringify(res) + "\n");
-        } catch (err) {
-          console.error("Failed to write IPC response back to gateway socket:", err);
-        }
-      }
+    const decision = await promptForApproval({
+      serverId: req.serverId,
+      toolName: req.toolName,
+      argumentsJson: req.arguments,
     });
+
+    if (decision.status === "APPROVED" && decision.remember) {
+      await saveApprovalRule(
+        db,
+        req.serverId,
+        req.toolName,
+        decision.remember,
+        decision.remember === "SESSION" ? SESSION_RULE_TTL_MS : 0
+      );
+    }
+
+    await updateApprovalStatus(db, req.id, decision.status).catch(() => undefined);
+    respond(decision.status);
+  } catch (err: any) {
+    log(`Approval handling failed, denying: ${err?.message ?? err}`);
+    // Fail closed on an internal error.
+    respond("DENIED");
+  } finally {
+    activePrompts.delete(req.id);
+  }
 }
 
-// Determines the SQLite database path
-function getDatabasePath(context: vscode.ExtensionContext): string {
-  const config = vscode.workspace.getConfiguration("mcpShield");
-  const customPath = config.get<string>("databasePath");
+/** Session rules last two hours, long enough for a work session. */
+const SESSION_RULE_TTL_MS = 2 * 60 * 60 * 1000;
 
-  if (customPath) {
-    if (path.isAbsolute(customPath)) {
-      return customPath;
-    }
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (workspaceRoot) {
-      return path.resolve(workspaceRoot, customPath);
-    }
-  }
-
-  // Default to workspace root if open
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (workspaceRoot) {
-    return path.join(workspaceRoot, "mcp-shield.db");
-  }
-
-  // Default to global storage
-  return path.join(context.globalStorageUri.fsPath, "mcp-shield.db");
+interface ApprovalDecision {
+  status: "APPROVED" | "DENIED";
+  /** Set when the user asked not to be prompted for this tool again. */
+  remember?: "ALWAYS" | "SESSION";
 }
 
-// Poll pending approvals in SQLite database and show detailed modal confirmation
+/**
+ * Show the authorization modal.
+ *
+ * The "Allow" / "Allow for Session" / "Always Allow" spread exists to solve a
+ * real security problem, not just an annoyance. When the only options are
+ * approve-every-time or disable protection, users disable protection. Offering a
+ * *scoped* standing approval — one tool, one server, optionally time-limited —
+ * removes the incentive to loosen the whole policy.
+ *
+ * Dismissing the dialog counts as DENIED. An unattended machine must not become
+ * an open door.
+ */
+async function promptForApproval(req: {
+  serverId: string;
+  toolName: string;
+  argumentsJson: string;
+}): Promise<ApprovalDecision> {
+  let formattedArgs: string;
+  try {
+    formattedArgs = JSON.stringify(JSON.parse(req.argumentsJson), null, 2);
+  } catch {
+    formattedArgs = req.argumentsJson;
+  }
+
+  // Keep the dialog readable; the dashboard has the full payload.
+  if (formattedArgs.length > 1500) {
+    formattedArgs = formattedArgs.slice(0, 1500) + "\n… (truncated, see dashboard)";
+  }
+
+  const detail =
+    `Server: ${req.serverId}\n` +
+    `Tool: ${req.toolName}\n\n` +
+    `Arguments:\n${formattedArgs}\n\n` +
+    `This tool passed automated policy checks and needs your authorization.`;
+
+  const selection = await vscode.window.showWarningMessage(
+    "MCP Shield — Authorization Required",
+    { modal: true, detail },
+    "Allow Once",
+    "Allow for Session",
+    "Always Allow"
+  );
+
+  switch (selection) {
+    case "Allow Once":
+      vscode.window.setStatusBarMessage("$(check) MCP Shield: tool call allowed", 3000);
+      return { status: "APPROVED" };
+    case "Allow for Session":
+      vscode.window.setStatusBarMessage(
+        `$(check) MCP Shield: '${req.toolName}' allowed for this session`,
+        4000
+      );
+      return { status: "APPROVED", remember: "SESSION" };
+    case "Always Allow":
+      vscode.window.setStatusBarMessage(
+        `$(check) MCP Shield: '${req.toolName}' always allowed — revoke from the dashboard`,
+        5000
+      );
+      return { status: "APPROVED", remember: "ALWAYS" };
+    default:
+      // Includes Cancel and dialog dismissal.
+      vscode.window.setStatusBarMessage("$(x) MCP Shield: tool call blocked", 3000);
+      return { status: "DENIED" };
+  }
+}
+
+/**
+ * Fallback path: offer approvals that the IPC channel did not claim.
+ *
+ * Only rows older than POLL_GRACE_MS are considered, so this never competes with
+ * the push channel for a live request.
+ */
 async function pollPendingApprovals(db: any) {
   try {
     const pending = await getActivePendingApprovals(db);
-    for (const app of pending) {
-      if (activePrompts.has(app.id)) {
-        continue;
-      }
+    const now = Date.now();
 
-      activePrompts.add(app.id);
+    for (const approval of pending) {
+      if (activePrompts.has(approval.id)) continue;
+      if (now - approval.timestamp < POLL_GRACE_MS) continue;
 
-      let formattedArgs = "";
-      try {
-        formattedArgs = JSON.stringify(JSON.parse(app.arguments), null, 2);
-      } catch {
-        formattedArgs = app.arguments;
-      }
-
-      // Display Modal for Explainability & explicit Least Privilege authorization
-      const detailMessage = `Server: ${app.server_id}\nTool: ${app.tool_name}\n\nArguments:\n${formattedArgs}\n\nChoose 'Allow' to run this tool call, or 'Block' to prevent execution.`;
-
-      vscode.window
-        .showWarningMessage(
-          `[MCP Shield Gating] Authorization Required`,
-          {
-            modal: true,
-            detail: detailMessage,
-          },
-          "Allow",
-          "Block"
-        )
-        .then(async (selection) => {
-          try {
-            if (selection === "Allow") {
-              await updateApprovalStatus(db, app.id, "APPROVED");
-              vscode.window.setStatusBarMessage(`$(check) MCP Shield: Tool call allowed`, 3000);
-            } else {
-              await updateApprovalStatus(db, app.id, "DENIED");
-              vscode.window.setStatusBarMessage(`$(x) MCP Shield: Tool call blocked`, 3000);
-            }
-          } catch (err: any) {
-            console.error(`Failed to update approval status: ${err.message}`);
-          } finally {
-            activePrompts.delete(app.id);
-          }
-        });
-    }
-  } catch (err) {
-    // Suppress polling errors
-  }
-}
-
-// Scans typical path locations for MCP configurations
-export interface DetectedConfig {
-  name: string;
-  path: string;
-  servers: {
-    id: string;
-    transport: "stdio" | "http";
-    command: string;
-    args: string[];
-    url?: string;
-    proxyPort?: number;
-    isShielded: boolean;
-  }[];
-}
-
-export function scanMcpConfigs(
-  context: vscode.ExtensionContext,
-  dbPath: string
-): DetectedConfig[] {
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const appData = process.env.APPDATA || "";
-  
-  const scanPaths = [
-    {
-      name: "Claude Desktop",
-      path:
-        process.platform === "win32"
-          ? path.join(appData, "Claude", "claude_desktop_config.json")
-          : process.platform === "darwin"
-          ? path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
-          : path.join(home, ".config", "Claude", "claude_desktop_config.json"),
-    },
-    {
-      name: "Cline Settings",
-      path:
-        process.platform === "win32"
-          ? path.join(appData, "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json")
-          : process.platform === "darwin"
-          ? path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json")
-          : path.join(home, ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"),
-    },
-    {
-      name: "Roo Code Settings",
-      path:
-        process.platform === "win32"
-          ? path.join(appData, "Code", "User", "globalStorage", "roodesignertoken.roo-cline", "settings", "cline_mcp_settings.json")
-          : process.platform === "darwin"
-          ? path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", "roodesignertoken.roo-cline", "settings", "cline_mcp_settings.json")
-          : path.join(home, ".config", "Code", "User", "globalStorage", "roodesignertoken.roo-cline", "settings", "cline_mcp_settings.json"),
-    }
-  ];
-
-  const results: DetectedConfig[] = [];
-  const gatewayPath = path.join(context.extensionPath, "dist", "gateway.js");
-  const gatewayHttpPath = path.join(context.extensionPath, "dist", "gateway-http.js");
-
-  for (const config of scanPaths) {
-    if (fs.existsSync(config.path)) {
-      try {
-        const rawContent = fs.readFileSync(config.path, "utf8");
-        const parsed = JSON.parse(rawContent);
-        const servers = parsed.mcpServers || {};
-        const detectedServers = [];
-
-        for (const serverId in servers) {
-          const s = servers[serverId];
-
-          // ── HTTP / SSE Transport ──────────────────────────────────────────
-          if (s.url) {
-            // Detect if HTTP server is already shielded (url points to localhost proxy)
-            let isShielded = false;
-            let originalUrl: string = s.url;
-            let proxyPort: number | undefined;
-
-            try {
-              const parsedUrl = new URL(s.url);
-              if (
-                (parsedUrl.hostname === "localhost" || parsedUrl.hostname === "127.0.0.1") &&
-                s._mcpShieldUpstream
-              ) {
-                isShielded = true;
-                originalUrl = s._mcpShieldUpstream;
-                proxyPort = parseInt(parsedUrl.port, 10);
-              }
-            } catch (_) {}
-
-            detectedServers.push({
-              id: serverId,
-              transport: "http" as const,
-              command: "",
-              args: [],
-              url: originalUrl,
-              proxyPort,
-              isShielded,
-            });
-            continue;
-          }
-
-          // ── STDIO Transport ───────────────────────────────────────────────
-          const argsList: string[] = s.args || [];
-          let isShielded = false;
-          let originalCommand = s.command;
-          let originalArgs = [...argsList];
-
-          if (
-            s.command === "node" &&
-            argsList.length > 0 &&
-            argsList[0].includes("gateway.js")
-          ) {
-            isShielded = true;
-            const separatorIdx = argsList.indexOf("--");
-            if (separatorIdx !== -1 && separatorIdx + 1 < argsList.length) {
-              originalCommand = argsList[separatorIdx + 1];
-              originalArgs = argsList.slice(separatorIdx + 2);
-            }
-          }
-
-          detectedServers.push({
-            id: serverId,
-            transport: "stdio" as const,
-            command: originalCommand,
-            args: originalArgs,
-            isShielded,
+      activePrompts.add(approval.id);
+      void (async () => {
+        try {
+          const decision = await promptForApproval({
+            serverId: approval.server_id,
+            toolName: approval.tool_name,
+            argumentsJson: approval.arguments,
           });
-        }
-
-        results.push({
-          name: config.name,
-          path: config.path,
-          servers: detectedServers,
-        });
-      } catch (err) {
-        console.error(`Failed to parse config at ${config.path}:`, err);
-      }
-    }
-  }
-
-  return results;
-}
-
-// Allocates an unused local TCP port for the HTTP proxy
-function allocateProxyPort(basePort: number = 3100): number {
-  // Simple incrementing allocator — scan existing shields to avoid collision
-  return basePort + Math.floor(Math.random() * 900);
-}
-
-// Performs the Shielding process by rewriting the target MCP configuration
-function toggleShieldServer(
-  context: vscode.ExtensionContext,
-  configPath: string,
-  serverId: string,
-  shield: boolean,
-  dbPath: string,
-  serverTransport: "stdio" | "http" = "stdio"
-): boolean {
-  if (!fs.existsSync(configPath)) return false;
-
-  try {
-    const rawContent = fs.readFileSync(configPath, "utf8");
-    const parsed = JSON.parse(rawContent);
-    const servers = parsed.mcpServers || {};
-
-    if (!servers[serverId]) return false;
-
-    const s = servers[serverId];
-
-    // Create a backup file before editing configuration
-    fs.writeFileSync(`${configPath}.bak`, rawContent, "utf8");
-
-    // ── HTTP Transport ────────────────────────────────────────────────────
-    if (serverTransport === "http" || s.url) {
-      const gatewayHttpPath = path.join(context.extensionPath, "dist", "gateway-http.js");
-
-      if (shield) {
-        if (s._mcpShieldUpstream) {
-          return true; // Already shielded
-        }
-        const proxyPort = allocateProxyPort();
-        const originalUrl: string = s.url;
-        // Rewrite the url to point to the local HTTP proxy
-        s._mcpShieldUpstream = originalUrl;
-        s._mcpShieldProxyPort = proxyPort;
-        s.url = `http://localhost:${proxyPort}`;
-        // Inject a launcher entry so the proxy process starts with the client
-        s._mcpShieldHttpLauncher = [
-          "node",
-          gatewayHttpPath,
-          "--server", serverId,
-          "--db", dbPath,
-          "--upstream", originalUrl,
-          "--port", String(proxyPort),
-        ];
-      } else {
-        // Unshield: restore original URL
-        if (s._mcpShieldUpstream) {
-          s.url = s._mcpShieldUpstream;
-          delete s._mcpShieldUpstream;
-          delete s._mcpShieldProxyPort;
-          delete s._mcpShieldHttpLauncher;
-        }
-      }
-
-      fs.writeFileSync(configPath, JSON.stringify(parsed, null, 2), "utf8");
-      return true;
-    }
-
-    // ── STDIO Transport ───────────────────────────────────────────────────
-    const gatewayPath = path.join(context.extensionPath, "dist", "gateway.js");
-
-    if (shield) {
-      // Shield: Wrap with gateway.js
-      if (s.command === "node" && s.args && s.args[0].includes("gateway.js")) {
-        return true; // Already shielded
-      }
-
-      const originalCommand = s.command;
-      const originalArgs = s.args || [];
-
-      s.command = "node";
-      s.args = [
-        gatewayPath,
-        "--server",
-        serverId,
-        "--db",
-        dbPath,
-        "--",
-        originalCommand,
-        ...originalArgs,
-      ];
-    } else {
-      // Unshield: Restore original command
-      if (s.command === "node" && s.args && s.args[0].includes("gateway.js")) {
-        const argsList: string[] = s.args;
-        const separatorIdx = argsList.indexOf("--");
-
-        if (separatorIdx !== -1 && separatorIdx + 1 < argsList.length) {
-          s.command = argsList[separatorIdx + 1];
-          s.args = argsList.slice(separatorIdx + 2);
-        }
-      }
-    }
-
-    fs.writeFileSync(configPath, JSON.stringify(parsed, null, 2), "utf8");
-    return true;
-  } catch (err) {
-    console.error(`Failed to toggle shield on ${serverId} in ${configPath}:`, err);
-    return false;
-  }
-}
-
-// Dashboard Webview Class
-class DashboardPanel {
-  public static currentPanel: DashboardPanel | undefined;
-  public static readonly viewType = "mcpShieldDashboard";
-
-  private readonly _panel: vscode.WebviewPanel;
-  private readonly _extensionUri: vscode.Uri;
-  private readonly _dbPath: string;
-  private _disposables: vscode.Disposable[] = [];
-  private _updateTimer: NodeJS.Timeout | null = null;
-
-  public static createOrShow(extensionUri: vscode.Uri, dbPath: string) {
-    const column = vscode.window.activeTextEditor
-      ? vscode.window.activeTextEditor.viewColumn
-      : undefined;
-
-    if (DashboardPanel.currentPanel) {
-      DashboardPanel.currentPanel._panel.reveal(column);
-      return;
-    }
-
-    const panel = vscode.window.createWebviewPanel(
-      DashboardPanel.viewType,
-      "MCP Shield Dashboard",
-      column || vscode.ViewColumn.One,
-      {
-        enableScripts: true,
-        localResourceRoots: [extensionUri],
-      }
-    );
-
-    DashboardPanel.currentPanel = new DashboardPanel(panel, extensionUri, dbPath);
-  }
-
-  private constructor(
-    panel: vscode.WebviewPanel,
-    extensionUri: vscode.Uri,
-    dbPath: string
-  ) {
-    this._panel = panel;
-    this._extensionUri = extensionUri;
-    this._dbPath = dbPath;
-
-    // Set HTML content
-    this._updateHtml();
-
-    // Handle panel disposal
-    this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
-
-    // Handle messages from Webview
-    this._panel.webview.onDidReceiveMessage(
-      async (message) => {
-        switch (message.command) {
-          case "refresh":
-            await this._sendDataToWebview();
-            break;
-
-          case "savePolicy":
-            if (dbInstance) {
-              await savePolicy(dbInstance, message.policy);
-              vscode.window.showInformationMessage(
-                `MCP Shield: Security policy updated for server '${message.policy.server_id}'.`
-              );
-              await this._sendDataToWebview();
-            }
-            break;
-
-          case "toggleShield":
-            const success = toggleShieldServer(
-              { extensionPath: this._extensionUri.fsPath } as any,
-              message.configPath,
-              message.serverId,
-              message.shield,
-              this._dbPath
+          if (decision.status === "APPROVED" && decision.remember) {
+            await saveApprovalRule(
+              db,
+              approval.server_id,
+              approval.tool_name,
+              decision.remember,
+              decision.remember === "SESSION" ? SESSION_RULE_TTL_MS : 0
             );
-            if (success) {
-              vscode.window.showInformationMessage(
-                `MCP Shield: Server '${message.serverId}' is now ${
-                  message.shield ? "Shielded" : "Unshielded"
-                }. Please restart your MCP client.`
-              );
-              await this._sendDataToWebview();
-            } else {
-              vscode.window.showErrorMessage(
-                `MCP Shield: Failed to configure shield for server '${message.serverId}'.`
-              );
-            }
-            break;
+          }
+          await updateApprovalStatus(db, approval.id, decision.status);
+        } catch (err: any) {
+          log(`Fallback approval failed: ${err?.message ?? err}`);
+        } finally {
+          activePrompts.delete(approval.id);
         }
-      },
-      null,
-      this._disposables
-    );
-
-    // Initial data load
-    this._sendDataToWebview();
-
-    // Set up real-time polling updates for the dashboard
-    this._updateTimer = setInterval(() => {
-      this._sendDataToWebview();
-    }, 2000);
-  }
-
-  private _updateHtml() {
-    this._panel.webview.html = getWebviewContent();
-  }
-
-  private async _sendDataToWebview() {
-    if (!dbInstance) return;
-
-    try {
-      const logs = await getAuditLogs(dbInstance, 100);
-      const warnings = await getWarnings(dbInstance);
-      const policies = await getAllPolicies(dbInstance);
-      const detectedConfigs = scanMcpConfigs(
-        { extensionPath: this._extensionUri.fsPath } as any,
-        this._dbPath
-      );
-
-      this._panel.webview.postMessage({
-        type: "updateData",
-        logs,
-        warnings,
-        policies,
-        configs: detectedConfigs,
-      });
-    } catch (err: any) {
-      console.error("Failed to fetch dashboard data:", err);
+      })();
     }
+  } catch {
+    // The proxy may be mid-write; a failed poll is retried in one second.
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Database location
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve where the policy database lives.
+ *
+ * Defaults to the extension's global storage, NOT the workspace root.
+ *
+ * The original defaulted to `<workspaceRoot>/mcp-shield.db`, which caused two
+ * problems. It scattered audit databases into unrelated projects, and — worse —
+ * the absolute path gets baked into the MCP client's config at shield time. Open
+ * a different folder in VS Code and the extension would open a *different*
+ * database with a *different* IPC pipe hash, so approval prompts silently stopped
+ * appearing until every gated call timed out.
+ *
+ * Global storage gives one database, one IPC channel, and policies that follow
+ * the user rather than the folder. A workspace-local file is still available by
+ * setting `mcpShield.databasePath` explicitly.
+ */
+function getDatabasePath(context: vscode.ExtensionContext): string {
+  const configured = vscode.workspace.getConfiguration("mcpShield").get<string>("databasePath");
+
+  if (configured && configured.trim() !== "") {
+    if (path.isAbsolute(configured)) return configured;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (workspaceRoot) return path.resolve(workspaceRoot, configured);
   }
 
-  public dispose() {
-    DashboardPanel.currentPanel = undefined;
-
-    this._panel.dispose();
-
-    if (this._updateTimer) {
-      clearInterval(this._updateTimer);
-    }
-
-    while (this._disposables.length) {
-      const x = this._disposables.pop();
-      if (x) {
-        x.dispose();
-      }
-    }
-  }
+  return path.join(context.globalStorageUri.fsPath, "mcp-shield.db");
 }
