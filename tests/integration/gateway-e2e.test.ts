@@ -41,6 +41,7 @@ class GatewayHarness {
   private child: ChildProcess;
   private buffer = "";
   private waiters = new Map<number, (frame: any) => void>();
+  private disposed = false;
 
   constructor(serverId: string, cwd: string) {
     this.child = spawn(
@@ -57,9 +58,12 @@ class GatewayHarness {
       if (text) console.error(`[gateway stderr] ${text}`);
     });
     this.child.on("error", (err) => console.error(`[gateway spawn error] ${err.message}`));
-    this.child.on("exit", (code, signal) =>
-      console.error(`[gateway exit] code=${code} signal=${signal}`)
-    );
+    this.child.on("exit", (code, signal) => {
+      // SIGTERM is our own teardown; anything else is a real failure worth seeing.
+      if (!this.disposed) {
+        console.error(`[gateway exited unexpectedly] code=${code} signal=${signal}`);
+      }
+    });
 
     this.child.stdout!.setEncoding("utf8");
     this.child.stdout!.on("data", (chunk: string) => {
@@ -116,6 +120,7 @@ class GatewayHarness {
   }
 
   dispose(): void {
+    this.disposed = true;
     try {
       this.child.kill();
     } catch {
