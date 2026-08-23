@@ -63,9 +63,14 @@ for (let i = 0; i < args.length; i++) {
   }
 }
 
-const isTesting = process.env.JEST_WORKER_ID !== undefined;
+/**
+ * Run as a proxy only when executed directly. See the equivalent comment in
+ * `gateway.ts`: an environment-variable check is wrong here because spawned
+ * children inherit the parent's environment.
+ */
+const isEntryPoint = typeof require !== "undefined" && require.main === module;
 
-if (!upstreamUrlStr && !isTesting) {
+if (!upstreamUrlStr && isEntryPoint) {
   console.error("Error: Upstream target URL not specified. Use '--upstream <url>'");
   process.exit(1);
 }
@@ -469,6 +474,6 @@ function sendJson(res: http.ServerResponse, payload: unknown): void {
   res.end(body);
 }
 
-if (!isTesting) {
+if (isEntryPoint) {
   start();
 }

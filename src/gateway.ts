@@ -80,10 +80,22 @@ for (let i = 0; i < ownArgsEnd; i++) {
 const targetCmd = separatorIndex !== -1 ? args[separatorIndex + 1] : null;
 const targetArgs = separatorIndex !== -1 ? args.slice(separatorIndex + 2) : [];
 
-/** Jest imports this module for its re-exports; suppress the side effects. */
-const isTesting = process.env.JEST_WORKER_ID !== undefined;
+/**
+ * Only run as a proxy when executed directly, not when imported.
+ *
+ * This must NOT be inferred from the environment. The previous version used
+ * `process.env.JEST_WORKER_ID !== undefined`, but spawned children inherit their
+ * parent's environment — so a gateway launched from inside a Jest process saw
+ * JEST_WORKER_ID, concluded it was "under test", skipped `start()` entirely and
+ * exited 0. That made genuine end-to-end testing impossible, and it would equally
+ * break any user whose environment happened to carry that variable.
+ *
+ * `require.main === module` asks the only question that actually matters: am I the
+ * entry point, or is someone importing me?
+ */
+const isEntryPoint = typeof require !== "undefined" && require.main === module;
 
-if (!targetCmd && !isTesting) {
+if (!targetCmd && isEntryPoint) {
   console.error("Error: Target command not specified. Use '-- <command> [args...]'");
   process.exit(1);
 }
@@ -333,6 +345,6 @@ async function handleServerMessage(line: string): Promise<void> {
 export { evaluatePolicy, classifyToolCapabilities } from "./policy";
 export { scanAndSanitizeTools } from "./compat";
 
-if (!isTesting) {
+if (isEntryPoint) {
   start();
 }
