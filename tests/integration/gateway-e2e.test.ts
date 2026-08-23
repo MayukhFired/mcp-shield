@@ -49,6 +49,18 @@ class GatewayHarness {
       { stdio: ["pipe", "pipe", "pipe"], shell: false, cwd }
     );
 
+    // Surface gateway diagnostics. Without this, a startup failure inside the
+    // subprocess presents only as an unexplained timeout in the test output.
+    this.child.stderr!.setEncoding("utf8");
+    this.child.stderr!.on("data", (chunk: string) => {
+      const text = chunk.trim();
+      if (text) console.error(`[gateway stderr] ${text}`);
+    });
+    this.child.on("error", (err) => console.error(`[gateway spawn error] ${err.message}`));
+    this.child.on("exit", (code, signal) =>
+      console.error(`[gateway exit] code=${code} signal=${signal}`)
+    );
+
     this.child.stdout!.setEncoding("utf8");
     this.child.stdout!.on("data", (chunk: string) => {
       this.buffer += chunk;
