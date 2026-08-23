@@ -1,14 +1,40 @@
-export function getWebviewContent(): string {
+/**
+ * MCP Shield — Dashboard Webview
+ * ==============================
+ *
+ * Security notes for this file, because it is the one place where attacker-
+ * controlled data meets a script-enabled context:
+ *
+ *   1. CONTENT SECURITY POLICY. The webview runs with `enableScripts: true`, so
+ *      it needs a CSP. `script-src` is restricted to a per-render nonce, which
+ *      means no inline event-handler attributes are permitted — every handler is
+ *      attached from the nonced script via event delegation. `default-src 'none'`
+ *      denies network access outright, so a redirected or injected resource
+ *      cannot phone home.
+ *
+ *   2. ESCAPING. Server ids, tool names, descriptions and warning details all
+ *      originate from the MCP server being inspected — which is precisely the
+ *      component we assume may be hostile. Every one of those values is passed
+ *      through `esc()` before it reaches `innerHTML`. Without that, a server
+ *      advertising a tool named `<img src=x onerror=...>` would get script
+ *      execution inside the dashboard of the tool auditing it.
+ *
+ *   3. NO REMOTE FONTS. The original loaded webfonts from Google Fonts. That
+ *      leaked usage metadata to a third party, broke offline use, and would be
+ *      denied by this CSP anyway. The stacks below fall back to system fonts.
+ *
+ * @param nonce      Fresh random value per render; must match the CSP header.
+ * @param cspSource  `webview.cspSource` from the VS Code API.
+ */
+export function getWebviewContent(nonce: string, cspSource: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; style-src ${cspSource} 'unsafe-inline'; font-src ${cspSource}; script-src 'nonce-${nonce}';">
   <title>MCP Shield Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  
+
   <style>
     :root {
       --bg-dark: #0A0D14;
