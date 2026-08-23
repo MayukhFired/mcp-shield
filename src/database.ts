@@ -1,15 +1,32 @@
 import { open, Database } from "sqlite";
 import sqlite3 from "sqlite3";
 
+/**
+ * Enforcement mode for a shielded server.
+ *
+ * `Permissive` is retained only so that databases written by earlier versions
+ * keep loading; it is treated as an alias for `Monitor`. See the extended note
+ * in `policy.ts` — the original `Permissive` mode skipped every scanner, which
+ * meant the button users pressed to stop approval prompts also silently disabled
+ * path gating, domain allowlisting and injection sanitization.
+ */
+export type PolicyMode = "Strict" | "Gated" | "Monitor" | "Permissive";
+
 export interface Policy {
   server_id: string;
-  mode: "Permissive" | "Gated" | "Strict";
+  mode: PolicyMode;
   readonly: number; // 1 = true, 0 = false
   allowed_paths: string; // JSON string array
   allowed_domains: string; // JSON string array
   disabled_tools: string; // JSON string array
   status: "Shielded" | "Unshielded";
   max_payload_kb: number; // 0 = disabled, >0 = max response size in KB
+  /** 1 = block tool calls carrying credential-shaped strings (threat T-07). */
+  block_secrets: number;
+  /** 1 = block any URL whose host is not in allowed_domains. 0 = only block when the list is non-empty. */
+  deny_unlisted_domains: number;
+  /** 1 = scan tool *results* for prompt-injection payloads and redact them (threat T-01). */
+  scan_results: number;
 }
 
 export interface AuditEntry {
@@ -22,6 +39,12 @@ export interface AuditEntry {
   reason: string;
   response?: string;
   duration_ms?: number;
+  /** 0-100, derived from the highest-severity policy finding. */
+  risk_score?: number;
+  /** JSON array of PolicyFinding objects, so the dashboard can show every rule hit. */
+  findings?: string;
+  /** Which JSON-RPC method was intercepted (tools/call, resources/read, ...). */
+  method?: string;
 }
 
 export interface SecurityWarning {
@@ -29,10 +52,34 @@ export interface SecurityWarning {
   timestamp: number;
   server_id: string;
   tool_name: string;
-  smell_type: "PROMPT_INJECTION" | "PATH_TRAVERSAL" | "SUSPICIOUS_SCHEMA";
+  smell_type:
+    | "PROMPT_INJECTION"
+    | "PATH_TRAVERSAL"
+    | "SUSPICIOUS_SCHEMA"
+    | "RESULT_INJECTION"
+    | "SECRET_EXFIL"
+    | "PAYLOAD_LIMIT";
   description: string;
   details: string;
   sanitized: number; // 1 = true, 0 = false
+}
+
+/**
+ * A standing user decision that lets a specific tool skip the approval prompt.
+ *
+ * This exists to fix a UX-as-security problem: when *every* gated call raises a
+ * blocking modal, users escape by loosening the whole policy. Letting them
+ * approve one tool once — permanently or for a session — removes the incentive
+ * to disable inspection wholesale.
+ */
+export interface ApprovalRule {
+  server_id: string;
+  tool_name: string;
+  /** ALWAYS persists indefinitely; SESSION expires at `expires_at`. */
+  scope: "ALWAYS" | "SESSION";
+  created_at: number;
+  /** Epoch ms after which a SESSION rule stops applying. 0 for ALWAYS. */
+  expires_at: number;
 }
 
 export interface PendingApproval {
@@ -110,13 +157,56 @@ async function initSchema(db: Database): Promise<void> {
       capabilities TEXT,
       PRIMARY KEY (server_id, tool_name)
     );
+
+    CREATE TABLE IF NOT EXISTS approval_rules (
+      server_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      scope TEXT NOT NULL DEFAULT 'ALWAYS',
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (server_id, tool_name)
+    );
+
+    -- The dashboard reads the newest audit rows constantly; without this index
+    -- every 2-second refresh becomes a full table scan once the log grows.
+    CREATE INDEX IF NOT EXISTS idx_audit_server_time
+      ON audit_log (server_id, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_pending_status
+      ON pending_approvals (status, timestamp);
   `);
 
-  // Safe migration for existing databases: add max_payload_kb if missing
-  const columns = await db.all("PRAGMA table_info(policies)");
-  const hasPayloadCol = columns.some((col: any) => col.name === "max_payload_kb");
-  if (!hasPayloadCol) {
-    await db.exec("ALTER TABLE policies ADD COLUMN max_payload_kb INTEGER NOT NULL DEFAULT 0;");
+  // ── Migrations ───────────────────────────────────────────────────────────
+  // Additive-only. Each call is a no-op when the column already exists, so the
+  // same code path works for a fresh database and one written by v0.1.0.
+  await ensureColumn(db, "policies", "max_payload_kb", "INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn(db, "policies", "block_secrets", "INTEGER NOT NULL DEFAULT 1");
+  await ensureColumn(db, "policies", "deny_unlisted_domains", "INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn(db, "policies", "scan_results", "INTEGER NOT NULL DEFAULT 1");
+  await ensureColumn(db, "audit_log", "risk_score", "INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn(db, "audit_log", "findings", "TEXT");
+  await ensureColumn(db, "audit_log", "method", "TEXT NOT NULL DEFAULT 'tools/call'");
+}
+
+/**
+ * Adds a column if it is not already present.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, so we inspect `PRAGMA table_info`
+ * first. Column names are hard-coded by callers (never user input), and PRAGMA
+ * does not accept bound parameters for the table name, so interpolation here is
+ * safe — but keep it that way: never pass a caller-supplied string in.
+ */
+async function ensureColumn(
+  db: Database,
+  table: string,
+  column: string,
+  definition: string
+): Promise<void> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(column)) {
+    throw new Error(`Refusing to migrate unsafe identifier: ${table}.${column}`);
+  }
+  const columns = await db.all(`PRAGMA table_info(${table})`);
+  if (!columns.some((col: any) => col.name === column)) {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
   }
 }
 
@@ -127,7 +217,10 @@ export async function getPolicy(db: Database, serverId: string): Promise<Policy>
     return policy;
   }
 
-  // Return default policy if none exists
+  // No row yet: return a secure-by-default policy rather than an empty object.
+  // Defaults matter here — this is what applies the first time an unknown server
+  // is shielded, so it must be the restrictive end of the range, not the
+  // permissive one.
   return {
     server_id: serverId,
     mode: "Gated",
@@ -137,22 +230,40 @@ export async function getPolicy(db: Database, serverId: string): Promise<Policy>
     disabled_tools: "[]",
     status: "Shielded",
     max_payload_kb: 0,
+    block_secrets: 1,
+    deny_unlisted_domains: 0,
+    scan_results: 1,
   };
 }
 
 export async function savePolicy(db: Database, policy: Policy): Promise<void> {
+  // Validate the enum-like fields before persisting. The policy row is the
+  // security source of truth and it is written from the webview, so an
+  // unrecognised mode string must not silently become "not Gated and not
+  // Strict" (which would have fallen through to allow).
+  const mode: PolicyMode = ["Strict", "Gated", "Monitor", "Permissive"].includes(policy.mode)
+    ? policy.mode
+    : "Gated";
+  const status = policy.status === "Unshielded" ? "Unshielded" : "Shielded";
+  const bit = (v: unknown, fallback: 0 | 1): number => (v === 1 || v === 0 ? v : fallback);
+
   await db.run(
-    `INSERT OR REPLACE INTO policies (server_id, mode, readonly, allowed_paths, allowed_domains, disabled_tools, status, max_payload_kb)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO policies (
+       server_id, mode, readonly, allowed_paths, allowed_domains, disabled_tools,
+       status, max_payload_kb, block_secrets, deny_unlisted_domains, scan_results
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       policy.server_id,
-      policy.mode,
-      policy.readonly,
+      mode,
+      bit(policy.readonly, 0),
       policy.allowed_paths,
       policy.allowed_domains,
       policy.disabled_tools,
-      policy.status,
-      policy.max_payload_kb || 0,
+      status,
+      Math.max(0, Number(policy.max_payload_kb) || 0),
+      bit(policy.block_secrets, 1),
+      bit(policy.deny_unlisted_domains, 0),
+      bit(policy.scan_results, 1),
     ]
   );
 }
@@ -164,8 +275,10 @@ export async function getAllPolicies(db: Database): Promise<Policy[]> {
 // Audit Logs
 export async function logAudit(db: Database, entry: AuditEntry): Promise<number> {
   const result = await db.run(
-    `INSERT INTO audit_log (timestamp, server_id, tool_name, arguments, decision, reason, response, duration_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO audit_log (
+       timestamp, server_id, tool_name, arguments, decision, reason,
+       response, duration_ms, risk_score, findings, method
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       entry.timestamp,
       entry.server_id,
@@ -175,6 +288,9 @@ export async function logAudit(db: Database, entry: AuditEntry): Promise<number>
       entry.reason,
       entry.response || null,
       entry.duration_ms || 0,
+      entry.risk_score || 0,
+      entry.findings || null,
+      entry.method || "tools/call",
     ]
   );
   return result.lastID!;
@@ -281,4 +397,80 @@ export async function getToolCapabilities(
     } catch {}
   }
   return [];
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Approval rules ("don't ask me again")
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Records a standing approval so a tool can skip the confirmation prompt.
+ *
+ * Scope semantics:
+ *   ALWAYS  — persists until the user revokes it from the dashboard.
+ *   SESSION — expires at `expiresAt`, so a long refactor can be waved through
+ *             without permanently widening the policy.
+ */
+export async function saveApprovalRule(
+  db: Database,
+  serverId: string,
+  toolName: string,
+  scope: "ALWAYS" | "SESSION",
+  ttlMs: number = 0
+): Promise<void> {
+  const now = Date.now();
+  await db.run(
+    `INSERT OR REPLACE INTO approval_rules (server_id, tool_name, scope, created_at, expires_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [serverId, toolName, scope, now, scope === "SESSION" ? now + ttlMs : 0]
+  );
+}
+
+/**
+ * Is there a live standing approval for this tool?
+ *
+ * Deliberately narrow: matches one exact server + tool pair. There is no
+ * wildcard form, because "always allow everything on this server" is what
+ * `Strict` mode is for, and conflating the two would let a single click
+ * silently widen scope well beyond what the user was looking at.
+ */
+export async function hasActiveApprovalRule(
+  db: Database,
+  serverId: string,
+  toolName: string
+): Promise<boolean> {
+  const row = await db.get<ApprovalRule>(
+    "SELECT * FROM approval_rules WHERE server_id = ? AND tool_name = ?",
+    serverId,
+    toolName
+  );
+  if (!row) return false;
+  if (row.scope === "ALWAYS") return true;
+  if (row.expires_at > Date.now()) return true;
+
+  // Expired session rule: clean it up so the table does not accumulate cruft.
+  await db.run(
+    "DELETE FROM approval_rules WHERE server_id = ? AND tool_name = ?",
+    [serverId, toolName]
+  );
+  return false;
+}
+
+export async function getApprovalRules(db: Database): Promise<ApprovalRule[]> {
+  return db.all<ApprovalRule[]>("SELECT * FROM approval_rules ORDER BY created_at DESC");
+}
+
+export async function deleteApprovalRule(
+  db: Database,
+  serverId: string,
+  toolName: string
+): Promise<void> {
+  await db.run(
+    "DELETE FROM approval_rules WHERE server_id = ? AND tool_name = ?",
+    [serverId, toolName]
+  );
+}
+
+/** Drops all SESSION-scoped rules. Called when the extension activates. */
+export async function clearSessionApprovalRules(db: Database): Promise<void> {
+  await db.run("DELETE FROM approval_rules WHERE scope = 'SESSION'");
 }
