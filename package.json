@@ -1,15 +1,23 @@
 {
   "name": "mcp-shield",
   "displayName": "MCP Shield",
-  "description": "A Security-First Middleware Gateway and Policy Enforcer for Model Context Protocol (MCP) servers.",
-  "version": "0.1.0",
+  "description": "A security-first middleware gateway and policy enforcer for Model Context Protocol (MCP) servers.",
+  "version": "0.2.0",
   "publisher": "cybersecurity",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.75.0"
   },
   "categories": [
     "Security",
     "Other"
+  ],
+  "keywords": [
+    "mcp",
+    "model context protocol",
+    "security",
+    "ai agent",
+    "prompt injection"
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
@@ -19,12 +27,22 @@
     "commands": [
       {
         "command": "mcp-shield.openDashboard",
-        "title": "MCP Shield: Open Security Dashboard",
+        "title": "Open Security Dashboard",
         "category": "MCP Shield"
       },
       {
         "command": "mcp-shield.scanConfigs",
-        "title": "MCP Shield: Scan and Shield MCP Configs",
+        "title": "Scan for MCP Configurations",
+        "category": "MCP Shield"
+      },
+      {
+        "command": "mcp-shield.runAttackDemo",
+        "title": "Run Attack Simulation",
+        "category": "MCP Shield"
+      },
+      {
+        "command": "mcp-shield.revokeAllRules",
+        "title": "Revoke All Standing Approvals",
         "category": "MCP Shield"
       }
     ],
@@ -40,20 +58,46 @@
     "views": {
       "mcp-shield-container": [
         {
-          "type": "webview",
           "id": "mcp-shield-sidebar",
-          "name": "Shield Overview"
+          "name": "Shielded Servers",
+          "icon": "resources/shield-icon.svg"
         }
       ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "mcp-shield.scanConfigs",
+          "when": "view == mcp-shield-sidebar",
+          "group": "navigation"
+        },
+        {
+          "command": "mcp-shield.openDashboard",
+          "when": "view == mcp-shield-sidebar",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "MCP Shield",
+      "properties": {
+        "mcpShield.databasePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the MCP Shield policy and audit database. Leave empty to use the extension's global storage, which keeps one database and one approval channel across all workspaces. A relative path is resolved against the first workspace folder.\n\n**Note:** the absolute path is written into your MCP client's configuration when a server is shielded, so changing this after shielding requires re-shielding those servers."
+        }
+      }
     }
   },
   "scripts": {
-    "vscode:prepublish": "node esbuild.js --production",
+    "vscode:prepublish": "npm run build -- --production",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "typecheck": "tsc -p ./ --noEmit",
+    "watch": "node esbuild.js --watch",
     "build": "node esbuild.js",
     "test": "jest",
-    "postinstall": "node -e \"console.log('Postinstall complete')\""
+    "test:watch": "jest --watch",
+    "package": "vsce package"
   },
   "dependencies": {
     "sqlite": "^5.1.1",
