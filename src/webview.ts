@@ -1038,12 +1038,13 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
                   <th>Server</th>
                   <th>Tool</th>
                   <th>Decision</th>
+                  <th title="0-100, from the highest-severity policy finding">Risk</th>
                   <th>Explanation / Context</th>
                 </tr>
               </thead>
               <tbody id="audit-logs-tbody">
                 <tr>
-                  <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 24px;">No logs recorded yet.</td>
+                  <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 24px;">No logs recorded yet.</td>
                 </tr>
               </tbody>
             </table>
@@ -1087,21 +1088,57 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
             <h3 class="section-title" id="policy-editor-title" style="font-size: 18px;">Edit Server Policy</h3>
             
             <div class="form-group">
-              <label class="form-label">Security Mode</label>
+              <label class="form-label">
+                <span>Security Mode</span>
+                <span class="form-label-desc">All three modes run every scanner. They differ only in what happens next.</span>
+              </label>
               <select class="select-input" id="policy-mode" style="width: 100%;">
-                <option value="Permissive">Permissive (Log Everything, Enforce Nothing)</option>
-                <option value="Gated">Gated (Prompt Developer for All Tools)</option>
-                <option value="Strict">Strict (Automated Security Rules + Enforce)</option>
+                <option value="Gated">Gated — scan, block violations, ask before allowed calls</option>
+                <option value="Strict">Strict — scan, block violations, allow clean calls silently</option>
+                <option value="Monitor">Monitor — scan and record, but never block (onboarding)</option>
               </select>
             </div>
 
             <div class="toggle-row">
               <div class="toggle-info">
                 <span class="toggle-title">Read-Only Mode</span>
-                <span class="toggle-desc">Blocks all actions that alter filesystem or execute processes.</span>
+                <span class="toggle-desc">Blocks all actions that alter the filesystem or execute processes.</span>
               </div>
               <label class="switch">
                 <input type="checkbox" id="policy-readonly">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">Block Credential Exfiltration</span>
+                <span class="toggle-desc">Refuses tool calls whose arguments contain API keys, tokens or private keys.</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="policy-block-secrets">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">Scan Tool Output</span>
+                <span class="toggle-desc">Redacts prompt-injection payloads found in tool results before the model reads them.</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="policy-scan-results">
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="toggle-row">
+              <div class="toggle-info">
+                <span class="toggle-title">Deny Unlisted Domains</span>
+                <span class="toggle-desc">Without this, an empty domain list allows every URL. Enable to deny by default.</span>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="policy-deny-unlisted">
                 <span class="slider"></span>
               </label>
             </div>
@@ -1262,9 +1299,9 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
     /**
      * Single delegated click handler.
      *
-     * The CSP restricts script-src to a nonce, which disallows inline `onclick`
+     * The CSP restricts script-src to a nonce, which disallows inline 'onclick'
      * attributes. Rather than attach a listener per element, elements declare
-     * their intent with `data-action` and this resolves it. Handles dynamically
+     * their intent with 'data-action' and this resolves it. Handles dynamically
      * created rows too, since the listener is on the document.
      */
     document.addEventListener('click', (event) => {
@@ -1495,15 +1532,15 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       } else {
         globalWarnings.forEach(warn => {
           const tr = document.createElement('tr');
-          
-          tr.innerHTML = 
-            '<td style="color: var(--text-muted);">' + formatTime(warn.timestamp) + '</td>' +
-            '<td style="font-weight: 500;">' + warn.server_id + '</td>' +
-            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + warn.tool_name + '</td>' +
-            '<td><span class="badge badge-warning">' + warn.smell_type + '</span></td>' +
-            '<td style="font-size: 12px; color: var(--text-muted);">' + warn.details + '</td>' +
+
+          tr.innerHTML =
+            '<td style="color: var(--text-muted);">' + esc(formatTime(warn.timestamp)) + '</td>' +
+            '<td style="font-weight: 500;">' + esc(warn.server_id) + '</td>' +
+            '<td style="font-family: \'JetBrains Mono\', monospace; font-size: 12px; color: var(--color-accent);">' + esc(warn.tool_name) + '</td>' +
+            '<td><span class="badge badge-warning">' + esc(warn.smell_type) + '</span></td>' +
+            '<td style="font-size: 12px; color: var(--text-muted);">' + esc(warn.details) + '</td>' +
             '<td><span class="badge ' + (warn.sanitized ? 'badge-success">SANITIZED' : 'badge-warning">DETECTED') + '</span></td>';
-          
+
           tbody.appendChild(tr);
         });
       }
@@ -1544,7 +1581,8 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
       
       document.getElementById('policy-editor-title').innerText = 'Edit Policy: ' + serverId;
 
-      // Get policy details
+      // Get policy details, falling back to the same secure defaults the
+      // database layer applies for a server that has never been configured.
       let policy = globalPolicies.find(p => p.server_id === serverId);
       if (!policy) {
         policy = {
@@ -1553,13 +1591,23 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
           readonly: 0,
           allowed_paths: '[]',
           allowed_domains: '[]',
-          disabled_tools: '[]'
+          disabled_tools: '[]',
+          block_secrets: 1,
+          scan_results: 1,
+          deny_unlisted_domains: 0
         };
       }
 
-      // Populate form fields
-      document.getElementById('policy-mode').value = policy.mode;
+      // Populate form fields. 'Permissive' is a legacy value from older
+      // databases; it behaves as Monitor, so show it as Monitor.
+      document.getElementById('policy-mode').value =
+        policy.mode === 'Permissive' ? 'Monitor' : policy.mode;
       document.getElementById('policy-readonly').checked = policy.readonly === 1;
+      // These default to on when the column is absent, matching the engine's
+      // '!== 0' checks, so an older policy row is protected rather than opted out.
+      document.getElementById('policy-block-secrets').checked = policy.block_secrets !== 0;
+      document.getElementById('policy-scan-results').checked = policy.scan_results !== 0;
+      document.getElementById('policy-deny-unlisted').checked = policy.deny_unlisted_domains === 1;
       
       try {
         document.getElementById('policy-paths').value = JSON.parse(policy.allowed_paths).join('\\n');
@@ -1601,13 +1649,21 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
         allowed_domains: JSON.stringify(domains),
         disabled_tools: JSON.stringify(disabledTools),
         status: 'Shielded',
-        max_payload_kb: maxPayloadKb
+        max_payload_kb: maxPayloadKb,
+        block_secrets: document.getElementById('policy-block-secrets').checked ? 1 : 0,
+        scan_results: document.getElementById('policy-scan-results').checked ? 1 : 0,
+        deny_unlisted_domains: document.getElementById('policy-deny-unlisted').checked ? 1 : 0
       };
 
       vscode.postMessage({
         command: 'savePolicy',
         policy: policy
       });
+    }
+
+    /** Revoke a standing "always allow" rule so the tool prompts again. */
+    function revokeRule(serverId, toolName) {
+      vscode.postMessage({ command: 'revokeRule', serverId, toolName });
     }
 
     // Config Assistant Tab Render
@@ -1631,10 +1687,10 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
         
         const cardHeader = document.createElement('div');
         cardHeader.className = 'config-card-header';
-        cardHeader.innerHTML = 
+        cardHeader.innerHTML =
           '<div class="config-title-group">' +
-            '<span class="config-name">' + config.name + '</span>' +
-            '<span class="config-path">' + config.path + '</span>' +
+            '<span class="config-name">' + esc(config.name) + '</span>' +
+            '<span class="config-path">' + esc(config.path) + '</span>' +
           '</div>';
         
         const cardBody = document.createElement('div');
@@ -1652,19 +1708,38 @@ export function getWebviewContent(nonce: string, cspSource: string): string {
             
             const btnText = server.isShielded ? 'Unshield' : 'Shield';
             const btnClass = server.isShielded ? 'btn-outline' : 'btn-primary';
-            const shieldBadge = server.isShielded 
-              ? '<span class="badge badge-success" style="margin-left: 10px;">Shielded</span>' 
+            const shieldBadge = server.isShielded
+              ? '<span class="badge badge-success" style="margin-left: 10px;">Shielded</span>'
               : '<span class="badge badge-danger" style="margin-left: 10px; opacity:0.6;">Unshielded</span>';
-            
-            row.innerHTML = 
+
+            // Transport is shown explicitly: HTTP servers behave differently and
+            // hiding that difference is how the old UI managed to report
+            // "Shielded" over a proxy that was not actually running.
+            const transportBadge = server.transport === 'http'
+              ? '<span class="badge badge-warning" style="margin-left: 8px;">HTTP</span>'
+              : '';
+
+            const cmdLine = server.transport === 'http'
+              ? (server.url || '')
+              : (server.command + ' ' + (server.args || []).join(' '));
+
+            row.innerHTML =
               '<div class="server-info">' +
                 '<div style="display:flex; align-items:center;">' +
-                  '<span class="server-id">' + server.id + '</span>' +
-                  shieldBadge +
+                  '<span class="server-id">' + esc(server.id) + '</span>' +
+                  shieldBadge + transportBadge +
                 '</div>' +
-                '<span class="server-cmd">' + server.command + ' ' + server.args.join(' ') + '</span>' +
+                '<span class="server-cmd">' + esc(cmdLine) + '</span>' +
               '</div>' +
-              '<button class="btn ' + btnClass + '" onclick="toggleShield(\'' + config.path + '\', \'' + server.id + '\', ' + !server.isShielded + ')">' +
+              // Values travel as data-* attributes read back with getAttribute,
+              // so a server id containing a quote cannot terminate the attribute
+              // and inject script. The original concatenated them straight into
+              // an onclick attribute.
+              '<button class="btn ' + btnClass + '"' +
+                ' data-action="toggle-shield"' +
+                ' data-config-path="' + esc(config.path) + '"' +
+                ' data-server-id="' + esc(server.id) + '"' +
+                ' data-shield="' + (!server.isShielded) + '">' +
                 btnText +
               '</button>';
             serverList.appendChild(row);
