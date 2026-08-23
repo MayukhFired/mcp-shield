@@ -1,33 +1,76 @@
+/**
+ * MCP Shield — stdio Gateway Proxy
+ * ================================
+ *
+ * A transparent man-in-the-middle for the MCP stdio transport.
+ *
+ * How it gets invoked
+ * -------------------
+ * The extension rewrites the MCP client's config so that instead of launching
+ *
+ *     command: "uvx", args: ["some-mcp-server"]
+ *
+ * the client launches
+ *
+ *     command: "node", args: [gateway.js, --server <id>, --db <path>, "--", "uvx", "some-mcp-server"]
+ *
+ * So the *client* spawns this proxy, and this proxy spawns the real server. That
+ * matters for two reasons: we inherit the client's process lifecycle management
+ * for free (no daemon to supervise), and we sit on the only channel the client
+ * and server have, so there is no path around us short of editing the config back.
+ *
+ * Data flow
+ * ---------
+ *     client stdin  → handleClientMessage → policy → child stdin
+ *     child stdout  → handleServerMessage → sanitize → client stdout
+ *
+ * Both directions are newline-delimited JSON-RPC. stderr is inherited straight
+ * through so the target server's diagnostics still reach the client, and so that
+ * our own logging (which must never touch stdout) stays visible.
+ *
+ * Invariant: nothing is ever written to stdout except well-formed JSON-RPC. A
+ * stray `console.log` here corrupts the protocol stream, which is why every
+ * diagnostic in this file uses `console.error`.
+ */
+
 import { spawn, ChildProcess } from "child_process";
 import * as path from "path";
-import * as url from "url";
-import * as net from "net";
-import { getSocketPath, ApprovalRequest, ApprovalResponse } from "./ipc";
 import {
   openDB,
   getPolicy,
   logAudit,
+  updateAuditResponse,
   logWarning,
-  getPendingApproval,
-  createPendingApproval,
-  deleteApproval,
   saveToolCapabilities,
-  getToolCapabilities,
-  Policy,
 } from "./database";
+import {
+  evaluatePolicy,
+  evaluateResourceAccess,
+  analyzeToolList,
+  scanTextForInjection,
+  classifyToolCapabilities,
+} from "./policy";
+import type { PolicyDecision } from "./policy";
+import { requestApproval, denialReason, APPROVAL_TIMEOUT_MS } from "./approval";
 
-// Parse CLI Arguments
-// Example command: node gateway.js --server git --db ./mcp-shield.db -- git-mcp-server args...
+// ─────────────────────────────────────────────────────────────────────────────
+// Command line
+// ─────────────────────────────────────────────────────────────────────────────
+// Example: node gateway.js --server git --db ./mcp-shield.db -- git-mcp-server --repo .
+
 const args = process.argv.slice(2);
 let serverId = "unknown-server";
 let dbPath = "mcp-shield.db";
-let separatorIndex = args.indexOf("--");
+const separatorIndex = args.indexOf("--");
 
-for (let i = 0; i < args.length && i < separatorIndex; i++) {
-  if (args[i] === "--server" && i + 1 < separatorIndex) {
+// Only parse our own flags, i.e. everything before the "--" separator. Anything
+// after it belongs to the target server and must be passed through untouched.
+const ownArgsEnd = separatorIndex === -1 ? args.length : separatorIndex;
+for (let i = 0; i < ownArgsEnd; i++) {
+  if (args[i] === "--server" && i + 1 < ownArgsEnd) {
     serverId = args[i + 1];
     i++;
-  } else if (args[i] === "--db" && i + 1 < separatorIndex) {
+  } else if (args[i] === "--db" && i + 1 < ownArgsEnd) {
     dbPath = args[i + 1];
     i++;
   }
@@ -35,6 +78,8 @@ for (let i = 0; i < args.length && i < separatorIndex; i++) {
 
 const targetCmd = separatorIndex !== -1 ? args[separatorIndex + 1] : null;
 const targetArgs = separatorIndex !== -1 ? args.slice(separatorIndex + 2) : [];
+
+/** Jest imports this module for its pure functions; suppress the side effects. */
 const isTesting = process.env.JEST_WORKER_ID !== undefined;
 
 if (!targetCmd && !isTesting) {
@@ -42,642 +87,671 @@ if (!targetCmd && !isTesting) {
   process.exit(1);
 }
 
-// Global Variables
+// ─────────────────────────────────────────────────────────────────────────────
+// Process state
+// ─────────────────────────────────────────────────────────────────────────────
+
 let db: any = null;
 let child: ChildProcess | null = null;
-const outstandingRequests = new Map<string | number, string>(); // id -> method
+let absoluteDbPath = dbPath;
+
+/**
+ * In-flight client requests, keyed by JSON-RPC id.
+ *
+ * We need the method to interpret the *response* (only a tools/list response
+ * should be run through the tool scanner), and we keep the audit row id plus a
+ * start timestamp so the response and its latency can be written back to the
+ * same audit entry. Without this the audit log's `response` and `duration_ms`
+ * columns stayed permanently empty.
+ */
+interface OutstandingRequest {
+  method: string;
+  auditId?: number;
+  startedAt: number;
+}
+const outstandingRequests = new Map<string | number, OutstandingRequest>();
+
+/** Guards against unbounded growth if a server never answers some requests. */
+const MAX_OUTSTANDING = 1000;
 
 async function start() {
   try {
-    // Resolve absolute path for SQLite DB
-    const absoluteDbPath = path.isAbsolute(dbPath)
-      ? dbPath
-      : path.resolve(process.cwd(), dbPath);
-
-    // Initialize database
+    absoluteDbPath = path.isAbsolute(dbPath) ? dbPath : path.resolve(process.cwd(), dbPath);
     db = await openDB(absoluteDbPath);
-    
-    // Spawn Target MCP Server safely (without shell to prevent command injection)
+
+    // shell: false is essential. With shell: true, a server id or argument
+    // containing shell metacharacters would be interpreted by the shell — the
+    // proxy itself would become the command-injection vector it exists to stop.
     child = spawn(targetCmd!, targetArgs, {
       stdio: ["pipe", "pipe", "inherit"],
       shell: false,
     });
 
     child.on("error", (err) => {
-      console.error(`[MCP Shield Proxy] Failed to start target server: ${err.message}`);
+      console.error(`[MCP Shield] Failed to start target server: ${err.message}`);
       process.exit(1);
     });
 
-    child.on("exit", (code, signal) => {
+    child.on("exit", (code) => {
       process.exit(code || 0);
     });
 
-    // Intercept Stdin (Client -> Proxy -> Target Server)
-    setupLineReader(process.stdin, async (line) => {
-      await handleClientMessage(line);
-    });
-
-    // Intercept Stdout (Target Server -> Proxy -> Client)
-    setupLineReader(child.stdout!, async (line) => {
-      await handleServerMessage(line);
-    });
-
+    setupLineReader(process.stdin, handleClientMessage);
+    setupLineReader(child.stdout!, handleServerMessage);
   } catch (err: any) {
-    console.error(`[MCP Shield Proxy] Initialization error: ${err.message}`);
+    // Fail closed: if we cannot open the policy database we cannot enforce
+    // anything, so we refuse to proxy rather than silently passing traffic.
+    console.error(`[MCP Shield] Initialization error: ${err.message}`);
     process.exit(1);
   }
 }
 
-// Stream splitter for newline-delimited JSON-RPC packets
+/**
+ * Split a stream into newline-delimited frames.
+ *
+ * Note the deliberate concurrency choice: handlers are dispatched without
+ * awaiting the previous one. A gated tool call can block for up to 90 seconds
+ * waiting for a human, and serializing would stall every other message behind
+ * it — including the client's own cancellation notifications. JSON-RPC carries
+ * request ids precisely so responses may arrive out of order, so interleaving is
+ * protocol-safe. Errors are caught per frame so one bad message cannot kill the
+ * proxy with an unhandled rejection.
+ */
 function setupLineReader(
   stream: NodeJS.ReadableStream,
   onLine: (line: string) => Promise<void>
 ) {
   let buffer = "";
-  stream.on("data", async (chunk) => {
+  stream.on("data", (chunk) => {
     buffer += chunk.toString("utf8");
     let idx;
     while ((idx = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.substring(0, idx);
+      const line = buffer.substring(0, idx).trim();
       buffer = buffer.substring(idx + 1);
-      await onLine(line.trim());
+      if (!line) continue;
+      void onLine(line).catch((err) => {
+        console.error(`[MCP Shield] Handler error: ${err?.message ?? err}`);
+      });
     }
   });
 }
 
-// Forward JSON-RPC error back to client
-function sendErrorToClient(id: string | number | null, code: number, message: string) {
-  const errorResponse = {
-    jsonrpc: "2.0",
-    id: id,
-    error: {
-      code: code,
-      message: `Blocked by MCP Shield: ${message}`,
-    },
-  };
-  process.stdout.write(JSON.stringify(errorResponse) + "\n");
+function writeToClient(payload: unknown) {
+  process.stdout.write(JSON.stringify(payload) + "\n");
 }
 
-// Policy Evaluation Engine
-export async function evaluatePolicy(
-  db: any,
-  policy: Policy,
-  toolName: string,
-  toolArgs: any
-): Promise<{ decision: "ALLOWED" | "BLOCKED"; reason: string }> {
-  // 1. Check if the server is unshielded
-  if (policy.status === "Unshielded") {
-    return { decision: "ALLOWED", reason: "Server status is set to Unshielded." };
-  }
-
-  // 2. Check Permissive mode
-  if (policy.mode === "Permissive") {
-    return { decision: "ALLOWED", reason: "Policy mode is Permissive." };
-  }
-
-  // 3. Check Disabled Tools
-  let disabledTools: string[] = [];
-  try {
-    disabledTools = JSON.parse(policy.disabled_tools);
-  } catch {}
-  if (disabledTools.includes(toolName)) {
-    return { decision: "BLOCKED", reason: `Tool '${toolName}' is disabled in the security policy.` };
-  }
-
-  // 4. Check Read-Only Mode
-  if (policy.readonly === 1) {
-    const capabilities = await getToolCapabilities(db, policy.server_id, toolName);
-    const hasWriteCapability = capabilities.includes("WRITE");
-
-    const writeRegex =
-      /write|delete|remove|update|create|execute|run|install|uninstall|post|put|patch|destroy|mkdir|rmdir|unlink/i;
-
-    const isBlocked = capabilities.length > 0 ? hasWriteCapability : writeRegex.test(toolName);
-
-    if (isBlocked) {
-      return {
-        decision: "BLOCKED",
-        reason: `Write operations are blocked on this server. Tool '${toolName}' is classified as write-capable or matches read-only restriction pattern.`,
-      };
-    }
-  }
-
-  // Scan arguments recursively for path traversal, command injection, and network requests
-  const argValues: string[] = [];
-  function extractStringValues(obj: any) {
-    if (typeof obj === "string") {
-      argValues.push(obj);
-    } else if (typeof obj === "object" && obj !== null) {
-      for (const key in obj) {
-        extractStringValues(obj[key]);
-      }
-    }
-  }
-  extractStringValues(toolArgs);
-
-  // 5. Directory Traversal / Path Gating (Strict and Gated modes)
-  let allowedPaths: string[] = [];
-  try {
-    allowedPaths = JSON.parse(policy.allowed_paths);
-  } catch {}
-  
-  // Default to process.cwd() if allowedPaths is empty
-  if (allowedPaths.length === 0) {
-    allowedPaths = [process.cwd()];
-  }
-
-  const resolvedAllowedPaths = allowedPaths.map((p) => path.resolve(p));
-
-  for (const val of argValues) {
-    // Check for explicit traversal sequences
-    if (val.includes("..") && (val.includes("/") || val.includes("\\"))) {
-      return {
-        decision: "BLOCKED",
-        reason: `Potential path traversal attempt detected in arguments: "${val}"`,
-      };
-    }
-
-    // Check absolute path containment if it looks like a path
-    if (path.isAbsolute(val) || val.startsWith("/") || val.startsWith("\\") || /^[a-zA-Z]:\\/.test(val)) {
-      const resolvedVal = path.resolve(val);
-      const isContained = resolvedAllowedPaths.some((allowed) =>
-        resolvedVal.startsWith(allowed)
-      );
-      if (!isContained) {
-        return {
-          decision: "BLOCKED",
-          reason: `Access to path outside authorized directories is blocked: "${val}". Authorized directories: ${allowedPaths.join(", ")}`,
-        };
-      }
-    }
-  }
-
-  // 6. Command Injection / Safety Gating
-  const dangerousCommandChars = /[;&|`$<>]/;
-  // If the tool name implies execution, check string arguments for metacharacters
-  if (/run|execute|shell|cmd|terminal/i.test(toolName)) {
-    for (const val of argValues) {
-      if (dangerousCommandChars.test(val)) {
-        return {
-          decision: "BLOCKED",
-          reason: `Dangerous shell metacharacter detected in command tool arguments: "${val}"`,
-        };
-      }
-    }
-  }
-
-  // 7. Network Gating (URL scanning)
-  let allowedDomains: string[] = [];
-  try {
-    allowedDomains = JSON.parse(policy.allowed_domains);
-  } catch {}
-
-  const urlRegex = /https?:\/\/[^\s"'()]+/g;
-  for (const val of argValues) {
-    const urls = val.match(urlRegex);
-    if (urls) {
-      for (const u of urls) {
-        try {
-          const parsed = new url.URL(u);
-          const hostname = parsed.hostname;
-
-          if (allowedDomains.length > 0) {
-            const isDomainAllowed = allowedDomains.some((domain) => {
-              if (domain.startsWith("*.")) {
-                const suffix = domain.substring(2);
-                return hostname === suffix || hostname.endsWith("." + suffix);
-              }
-              return hostname === domain;
-            });
-
-            if (!isDomainAllowed) {
-              return {
-                decision: "BLOCKED",
-                reason: `External URL access blocked: "${u}". Domain '${hostname}' is not in the allowed list: ${allowedDomains.join(", ")}`,
-              };
-            }
-          }
-        } catch {
-          // Invalid URL format, parse failure
-          return {
-            decision: "BLOCKED",
-            reason: `Malformed URL pattern detected in arguments: "${u}"`,
-          };
-        }
-      }
-    }
-  }
-
-  return { decision: "ALLOWED", reason: "Passed all automated security rules." };
-}
-
-function askApprovalViaIpc(dbPath: string, req: ApprovalRequest): Promise<"APPROVED" | "DENIED" | null> {
-  return new Promise((resolve) => {
-    const socketPath = getSocketPath(dbPath);
-    const client = net.connect(socketPath);
-
-    client.on("connect", () => {
-      client.write(JSON.stringify(req) + "\n");
-    });
-
-    let buffer = "";
-    client.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
-      let idx;
-      while ((idx = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.substring(0, idx).trim();
-        buffer = buffer.substring(idx + 1);
-        if (line) {
-          try {
-            const res = JSON.parse(line) as ApprovalResponse;
-            if (res.id === req.id) {
-              client.destroy();
-              resolve(res.status);
-              return;
-            }
-          } catch (e) {}
-        }
-      }
-    });
-
-    client.on("error", () => {
-      resolve(null);
-    });
-
-    client.on("close", () => {
-      resolve(null);
-    });
-
-    // Enforce gateway's own timeout (90s limit)
-    setTimeout(() => {
-      client.destroy();
-      resolve(null);
-    }, 90000);
-  });
-}
-
-// Client Input Handler (Client -> Proxy -> Target Server)
-async function handleClientMessage(line: string) {
-  if (!line) return;
-
-  let msg: any;
-  try {
-    msg = JSON.parse(line);
-  } catch {
-    // If not JSON-RPC, forward raw line to avoid breaking raw channels
-    if (child && child.stdin) {
-      child.stdin.write(line + "\n");
-    }
-    return;
-  }
-
-  // Track client requests to match response methods later
-  if (msg.id !== undefined && msg.method) {
-    outstandingRequests.set(msg.id, msg.method);
-  }
-
-  // Intercept tool calls
-  if (msg.method === "tools/call") {
-    const toolName = msg.params?.name;
-    const toolArgs = msg.params?.arguments || {};
-    const reqId = msg.id;
-
-    // Fetch active policy
-    const policy = await getPolicy(db, serverId);
-
-    // Evaluate automated checks
-    const evaluation = await evaluatePolicy(db, policy, toolName, toolArgs);
-
-    if (evaluation.decision === "BLOCKED") {
-      // 1. Audit Log Block Event
-      await logAudit(db, {
-        timestamp: Date.now(),
-        server_id: serverId,
-        tool_name: toolName,
-        arguments: JSON.stringify(toolArgs),
-        decision: "BLOCKED",
-        reason: evaluation.reason,
-      });
-
-      // 2. Reject client request
-      sendErrorToClient(reqId, -32000, evaluation.reason);
-      return;
-    }
-
-    // Gated Interactive Confirmation mode
-    if (policy.mode === "Gated") {
-      const approvalId = `approval_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-
-      // Log the pending request to the SQLite database
-      await createPendingApproval(db, {
-        id: approvalId,
-        timestamp: Date.now(),
-        server_id: serverId,
-        tool_name: toolName,
-        arguments: JSON.stringify(toolArgs),
-        status: "PENDING",
-      });
-
-      // Poll database for user's decision (timeout after 90 seconds)
-      let userDecision: "APPROVED" | "DENIED" | "TIMEOUT" = "TIMEOUT";
-
-      // Try IPC first
-      const ipcResult = await askApprovalViaIpc(dbPath, {
-        id: approvalId,
-        serverId,
-        toolName,
-        arguments: JSON.stringify(toolArgs),
-      });
-
-      if (ipcResult !== null) {
-        userDecision = ipcResult;
-      } else {
-        // Fallback to polling database for user's decision (timeout after 90 seconds)
-        const pollStartTime = Date.now();
-        const timeoutMs = 90000;
-
-        while (Date.now() - pollStartTime < timeoutMs) {
-          const approval = await getPendingApproval(db, approvalId);
-          if (approval) {
-            if (approval.status === "APPROVED") {
-              userDecision = "APPROVED";
-              break;
-            } else if (approval.status === "DENIED") {
-              userDecision = "DENIED";
-              break;
-            }
-          } else {
-            // If deleted, count as denied
-            userDecision = "DENIED";
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 150));
-        }
-      }
-
-      // Cleanup pending entry
-      await deleteApproval(db, approvalId);
-
-      if (userDecision === "APPROVED") {
-        // Log event allowed by developer
-        const auditId = await logAudit(db, {
-          timestamp: Date.now(),
-          server_id: serverId,
-          tool_name: toolName,
-          arguments: JSON.stringify(toolArgs),
-          decision: "ALLOWED",
-          reason: "Approved manually by developer.",
-        });
-
-        // Forward to real server
-        if (child && child.stdin) {
-          child.stdin.write(line + "\n");
-        }
-        return;
-      } else {
-        const blockReason =
-          userDecision === "TIMEOUT"
-            ? "Request timed out waiting for developer approval (90s limit)."
-            : "Rejected manually by developer.";
-
-        await logAudit(db, {
-          timestamp: Date.now(),
-          server_id: serverId,
-          tool_name: toolName,
-          arguments: JSON.stringify(toolArgs),
-          decision: "BLOCKED",
-          reason: blockReason,
-        });
-
-        sendErrorToClient(reqId, -32002, blockReason);
-        return;
-      }
-    }
-
-    // If allowed in strict/permissive mode, log and forward
-    await logAudit(db, {
-      timestamp: Date.now(),
-      server_id: serverId,
-      tool_name: toolName,
-      arguments: JSON.stringify(toolArgs),
-      decision: "ALLOWED",
-      reason: evaluation.reason,
-    });
-
-    if (child && child.stdin) {
-      child.stdin.write(line + "\n");
-    }
-    return;
-  }
-
-  // Forward all other requests
-  if (child && child.stdin) {
+function forwardToChild(line: string) {
+  if (child && child.stdin && child.stdin.writable) {
     child.stdin.write(line + "\n");
   }
 }
 
-// Server Response Handler (Target Server -> Proxy -> Client)
-async function handleServerMessage(line: string) {
-  if (!line) return;
+/** Build a JSON-RPC error object for a blocked request. */
+function blockedError(id: string | number | null, code: number, message: string) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: { code, message: `Blocked by MCP Shield: ${message}` },
+  };
+}
 
+function sendErrorToClient(id: string | number | null, code: number, message: string) {
+  writeToClient(blockedError(id, code, message));
+}
+
+function rememberRequest(id: string | number, entry: OutstandingRequest) {
+  if (outstandingRequests.size >= MAX_OUTSTANDING) {
+    // Drop the oldest tracked request rather than leaking memory. Losing the
+    // correlation only costs us response enrichment, never enforcement.
+    const oldest = outstandingRequests.keys().next().value;
+    if (oldest !== undefined) outstandingRequests.delete(oldest);
+  }
+  outstandingRequests.set(id, entry);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Client → server
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Entry point for every frame arriving from the MCP client.
+ *
+ * Handles three shapes:
+ *   - a single JSON-RPC object
+ *   - a JSON-RPC *batch* (array), which the original implementation forwarded
+ *     unexamined because an array has no `.method` property — a complete bypass
+ *     of every policy rule
+ *   - non-JSON, forwarded untouched so raw channels are not broken
+ */
+async function handleClientMessage(line: string): Promise<void> {
   let msg: any;
   try {
     msg = JSON.parse(line);
   } catch {
-    // If not JSON, write directly to client
+    forwardToChild(line);
+    return;
+  }
+
+  if (Array.isArray(msg)) {
+    await handleClientBatch(msg, line);
+    return;
+  }
+
+  const verdict = await screenClientRequest(msg);
+  if (verdict.action === "BLOCK") {
+    sendErrorToClient(msg.id ?? null, verdict.code, verdict.reason);
+    return;
+  }
+
+  if (msg.id !== undefined && msg.method) {
+    rememberRequest(msg.id, {
+      method: msg.method,
+      auditId: verdict.auditId,
+      startedAt: Date.now(),
+    });
+  }
+
+  forwardToChild(line);
+}
+
+/**
+ * Screen a JSON-RPC batch.
+ *
+ * Policy: if any member of the batch would be blocked, the whole batch is
+ * rejected. Partial execution of a batch is ambiguous — the client cannot tell
+ * which members ran — and permitting the clean members while blocking one is an
+ * invitation to smuggle a call in alongside benign traffic. Note that the current
+ * MCP specification does not use JSON-RPC batching, so this path exists to be
+ * safe rather than to be used.
+ */
+async function handleClientBatch(batch: any[], line: string): Promise<void> {
+  const verdicts = await Promise.all(batch.map((member) => screenClientRequest(member)));
+  const blockedIndex = verdicts.findIndex((v) => v.action === "BLOCK");
+
+  if (blockedIndex === -1) {
+    for (let i = 0; i < batch.length; i++) {
+      const member = batch[i];
+      const verdict = verdicts[i];
+      if (member && member.id !== undefined && member.method) {
+        rememberRequest(member.id, {
+          method: member.method,
+          auditId: verdict.action === "FORWARD" ? verdict.auditId : undefined,
+          startedAt: Date.now(),
+        });
+      }
+    }
+    forwardToChild(line);
+    return;
+  }
+
+  const blocked = verdicts[blockedIndex] as { reason: string; code: number };
+  const responses = batch
+    .filter((member) => member && member.id !== undefined)
+    .map((member) =>
+      blockedError(
+        member.id,
+        blocked.code,
+        `Batch rejected because one or more members violated policy: ${blocked.reason}`
+      )
+    );
+
+  if (responses.length > 0) {
+    writeToClient(responses);
+  }
+}
+
+type Verdict =
+  | { action: "FORWARD"; auditId?: number }
+  | { action: "BLOCK"; reason: string; code: number };
+
+/**
+ * Apply policy to one JSON-RPC request.
+ *
+ * Which methods are intercepted, and why:
+ *
+ *   tools/call     — the obvious one: arbitrary side effects.
+ *   resources/read — previously unguarded. A server that exposes the filesystem
+ *                    as MCP *resources* rather than tools bypassed path gating
+ *                    entirely. Enforced but not prompted, because resource reads
+ *                    are high-frequency and a prompt per read is unusable; the
+ *                    containment rules carry the weight here.
+ *   everything else — forwarded. Notifications, initialize, ping and completion
+ *                    carry no direct capability to touch the host.
+ */
+async function screenClientRequest(msg: any): Promise<Verdict> {
+  if (!msg || typeof msg !== "object" || !msg.method) {
+    return { action: "FORWARD" };
+  }
+
+  if (msg.method === "tools/call") {
+    return screenToolCall(msg);
+  }
+
+  if (msg.method === "resources/read") {
+    return screenResourceRead(msg);
+  }
+
+  return { action: "FORWARD" };
+}
+
+async function screenToolCall(msg: any): Promise<Verdict> {
+  const toolName: string = msg.params?.name ?? "<unnamed>";
+  const toolArgs = msg.params?.arguments ?? {};
+  const argumentsJson = safeStringify(toolArgs);
+
+  const policy = await getPolicy(db, serverId);
+  const evaluation = await evaluatePolicy(db, policy, toolName, toolArgs);
+
+  if (evaluation.decision === "BLOCKED") {
+    await auditDecision({
+      toolName,
+      argumentsJson,
+      decision: "BLOCKED",
+      evaluation,
+      method: "tools/call",
+    });
+    return { action: "BLOCK", reason: evaluation.reason, code: -32000 };
+  }
+
+  // Monitor mode may allow a call that produced findings. Record them so the
+  // dashboard can show "this would have been blocked under Strict".
+  if (evaluation.findings.length > 0) {
+    await recordFindingWarnings(toolName, evaluation);
+  }
+
+  if (policy.mode === "Gated") {
+    const outcome = await requestApproval({
+      db,
+      dbPath: absoluteDbPath,
+      serverId,
+      toolName,
+      argumentsJson,
+    });
+
+    if (outcome.status !== "APPROVED") {
+      const reason = denialReason(outcome.status, APPROVAL_TIMEOUT_MS);
+      await auditDecision({
+        toolName,
+        argumentsJson,
+        decision: "BLOCKED",
+        evaluation: { ...evaluation, reason },
+        method: "tools/call",
+      });
+      return { action: "BLOCK", reason, code: -32002 };
+    }
+
+    const auditId = await auditDecision({
+      toolName,
+      argumentsJson,
+      decision: "ALLOWED",
+      evaluation: {
+        ...evaluation,
+        reason:
+          outcome.channel === "RULE"
+            ? `Auto-approved by a standing approval rule for '${toolName}'.`
+            : "Approved manually by developer.",
+      },
+      method: "tools/call",
+    });
+    return { action: "FORWARD", auditId };
+  }
+
+  const auditId = await auditDecision({
+    toolName,
+    argumentsJson,
+    decision: "ALLOWED",
+    evaluation,
+    method: "tools/call",
+  });
+  return { action: "FORWARD", auditId };
+}
+
+async function screenResourceRead(msg: any): Promise<Verdict> {
+  const uri: string = msg.params?.uri ?? "";
+  const policy = await getPolicy(db, serverId);
+  const evaluation = evaluateResourceAccess(policy, uri);
+
+  if (evaluation.decision === "BLOCKED") {
+    await auditDecision({
+      toolName: `resources/read:${uri}`,
+      argumentsJson: safeStringify({ uri }),
+      decision: "BLOCKED",
+      evaluation,
+      method: "resources/read",
+    });
+    return { action: "BLOCK", reason: evaluation.reason, code: -32000 };
+  }
+
+  const auditId = await auditDecision({
+    toolName: `resources/read:${uri}`,
+    argumentsJson: safeStringify({ uri }),
+    decision: "ALLOWED",
+    evaluation,
+    method: "resources/read",
+  });
+  return { action: "FORWARD", auditId };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Server → client
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Inspect frames coming back from the target server.
+ *
+ * Three transformations happen here:
+ *   1. tools/list responses are scanned and prompt-injection text redacted (T-01).
+ *   2. tools/call and resources/read *results* are scanned for injected
+ *      instructions. This is the half of T-01 the original missed: indirect
+ *      prompt injection arrives in the content the agent reads, not in the tool's
+ *      advertised description.
+ *   3. Oversized payloads are truncated to protect the agent's context window.
+ */
+async function handleServerMessage(line: string): Promise<void> {
+  let msg: any;
+  try {
+    msg = JSON.parse(line);
+  } catch {
     process.stdout.write(line + "\n");
     return;
   }
 
-  // Intercept responses to client requests
-  if (msg.id !== undefined) {
-    const requestMethod = outstandingRequests.get(msg.id);
-    outstandingRequests.delete(msg.id);
+  if (Array.isArray(msg)) {
+    process.stdout.write(line + "\n");
+    return;
+  }
 
-    // Intercept response to tools/list to scan for security smells
-    if (requestMethod === "tools/list" && msg.result && Array.isArray(msg.result.tools)) {
-      const originalTools = msg.result.tools;
-      const sanitizedTools = scanAndSanitizeTools(originalTools, serverId);
-      
-      // Replace the tools list with the sanitized version
-      msg.result.tools = sanitizedTools;
-      process.stdout.write(JSON.stringify(msg) + "\n");
+  if (msg.id === undefined) {
+    process.stdout.write(line + "\n");
+    return;
+  }
+
+  const pending = outstandingRequests.get(msg.id);
+  outstandingRequests.delete(msg.id);
+
+  if (!pending) {
+    process.stdout.write(line + "\n");
+    return;
+  }
+
+  try {
+    if (pending.method === "tools/list" && msg.result && Array.isArray(msg.result.tools)) {
+      msg.result.tools = await applyToolListScan(msg.result.tools);
+      writeToClient(msg);
       return;
     }
 
-    // Payload Size Limit: Intercept tools/call responses that exceed the configured limit
-    if (requestMethod === "tools/call" && msg.result) {
+    if (
+      (pending.method === "tools/call" || pending.method === "resources/read") &&
+      msg.result
+    ) {
       const policy = await getPolicy(db, serverId);
+      let mutated = false;
 
-      if (policy.max_payload_kb > 0) {
-        const limitBytes = policy.max_payload_kb * 1024;
-        const lineBytes = Buffer.byteLength(line, "utf8");
+      if (policy.scan_results !== 0) {
+        mutated = (await scanResultForInjection(msg, pending.method)) || mutated;
+      }
+      mutated = (await enforcePayloadLimit(msg, line, policy.max_payload_kb)) || mutated;
 
-        if (lineBytes > limitBytes) {
-          // Truncate text content blocks to fit within the limit
-          if (msg.result.content && Array.isArray(msg.result.content)) {
-            for (const block of msg.result.content) {
-              if (block.type === "text" && typeof block.text === "string") {
-                const textBytes = Buffer.byteLength(block.text, "utf8");
-                if (textBytes > limitBytes) {
-                  // Slice to approximate byte budget (UTF-8 safe via substring)
-                  let truncated = block.text.substring(0, limitBytes);
-                  truncated += `\n\n... [TRUNCATED BY MCP SHIELD: Payload exceeded ${policy.max_payload_kb} KB limit (${Math.round(textBytes / 1024)} KB received). Please use tools to read smaller chunks, or refine your search.]`;
-                  block.text = truncated;
-                }
-              }
-            }
-          }
+      const serialized = mutated ? JSON.stringify(msg) : line;
+      await recordResponse(pending, serialized);
+      process.stdout.write(serialized + "\n");
+      return;
+    }
 
-          // Log the truncation event as a security warning
-          if (db) {
-            logWarning(db, {
-              timestamp: Date.now(),
-              server_id: serverId,
-              tool_name: `tools/call response (id: ${msg.id})`,
-              smell_type: "SUSPICIOUS_SCHEMA",
-              description: `Response payload exceeded configured limit of ${policy.max_payload_kb} KB.`,
-              details: `Original size: ${Math.round(lineBytes / 1024)} KB. Limit: ${policy.max_payload_kb} KB. Response was automatically truncated to protect context window.`,
-              sanitized: 1,
-            }).catch((err) => {
-              console.error(`[MCP Shield] Failed to log payload truncation warning: ${err.message}`);
-            });
-          }
+    await recordResponse(pending, line);
+    process.stdout.write(line + "\n");
+  } catch (err: any) {
+    // Never drop a response because our own inspection failed — that would hang
+    // the client waiting for an id that will never be answered.
+    console.error(`[MCP Shield] Response inspection failed: ${err?.message ?? err}`);
+    process.stdout.write(line + "\n");
+  }
+}
 
-          // Forward the truncated message
-          process.stdout.write(JSON.stringify(msg) + "\n");
-          return;
-        }
+/** Persist tool capabilities and smells discovered in a tools/list response. */
+async function applyToolListScan(tools: any[]): Promise<any[]> {
+  const result = analyzeToolList(tools);
+
+  // Awaited rather than fire-and-forget, so a write failure is visible and the
+  // capability cache is actually populated before the next call is evaluated.
+  await Promise.all(
+    result.capabilities.map((entry) =>
+      saveToolCapabilities(db, serverId, entry.toolName, entry.capabilities).catch((err) =>
+        console.error(`[MCP Shield] Failed to cache capabilities: ${err.message}`)
+      )
+    )
+  );
+
+  await Promise.all(
+    result.smells.map((smell) =>
+      logWarning(db, {
+        timestamp: Date.now(),
+        server_id: serverId,
+        tool_name: smell.toolName,
+        smell_type: smell.smellType,
+        description: smell.originalDescription,
+        details: smell.details,
+        sanitized: smell.smellType === "PROMPT_INJECTION" ? 1 : 0,
+      }).catch((err) => console.error(`[MCP Shield] Failed to log warning: ${err.message}`))
+    )
+  );
+
+  return result.tools;
+}
+
+/**
+ * Scan text blocks in a result for instruction-override payloads.
+ * Returns true when the message was modified.
+ */
+async function scanResultForInjection(msg: any, method: string): Promise<boolean> {
+  const blocks: { text: string; set: (v: string) => void }[] = [];
+
+  if (Array.isArray(msg.result?.content)) {
+    for (const block of msg.result.content) {
+      if (block && block.type === "text" && typeof block.text === "string") {
+        blocks.push({ text: block.text, set: (v) => (block.text = v) });
+      }
+    }
+  }
+  if (Array.isArray(msg.result?.contents)) {
+    for (const block of msg.result.contents) {
+      if (block && typeof block.text === "string") {
+        blocks.push({ text: block.text, set: (v) => (block.text = v) });
       }
     }
   }
 
-  // Forward all other messages unmodified
-  process.stdout.write(line + "\n");
+  let mutated = false;
+  for (const block of blocks) {
+    const { matches, sanitized } = scanTextForInjection(block.text);
+    if (matches.length === 0) continue;
+    block.set(sanitized);
+    mutated = true;
+    await logWarning(db, {
+      timestamp: Date.now(),
+      server_id: serverId,
+      tool_name: `${method} response`,
+      smell_type: "RESULT_INJECTION",
+      description: matches.join(" | ").slice(0, 500),
+      details: `Instruction-override payload found in tool output and redacted before it reached the model. Patterns: ${matches
+        .map((m) => JSON.stringify(m.slice(0, 120)))
+        .join(", ")}`,
+      sanitized: 1,
+    }).catch((err) => console.error(`[MCP Shield] Failed to log warning: ${err.message}`));
+  }
+
+  return mutated;
 }
 
-export function classifyToolCapabilities(tool: any): string[] {
-  const capabilities: string[] = [];
-  const name = (tool.name || "").toLowerCase();
+/**
+ * Truncate oversized responses.
+ *
+ * Two fixes over the original: the byte budget is applied by measuring bytes
+ * rather than slicing characters with a byte count, and the limit applies to the
+ * *total* of all text blocks instead of each block individually (previously N
+ * blocks each just under the limit passed through unchecked).
+ */
+async function enforcePayloadLimit(
+  msg: any,
+  originalLine: string,
+  maxPayloadKb: number
+): Promise<boolean> {
+  if (!maxPayloadKb || maxPayloadKb <= 0) return false;
 
-  // Keywords indicating mutate / write capability
-  const writeKeywords = [
-    "write", "delete", "remove", "update", "create", "execute", "run",
-    "install", "uninstall", "post", "put", "patch", "destroy", "mkdir",
-    "rmdir", "unlink", "apply", "commit", "push", "save", "edit", "modify",
-    "append", "set", "touch", "exec"
-  ];
+  const limitBytes = maxPayloadKb * 1024;
+  const totalBytes = Buffer.byteLength(originalLine, "utf8");
+  if (totalBytes <= limitBytes) return false;
 
-  // Keywords indicating read-only / query capability
-  const readKeywords = [
-    "read", "get", "list", "describe", "view", "show", "info", "query",
-    "explain", "check", "scan", "search", "find", "status", "audit"
-  ];
+  const blocks: any[] = Array.isArray(msg.result?.content) ? msg.result.content : [];
+  const textBlocks = blocks.filter(
+    (b) => b && b.type === "text" && typeof b.text === "string"
+  );
 
-  // If name has write keywords
-  let isWrite = writeKeywords.some(kw => name.includes(kw));
-
-  // If it matches a write keyword, check if it's overridden by a read keyword in name
-  if (isWrite) {
-    const hasReadPrefix = readKeywords.some(kw => name.startsWith(kw));
-    // If name starts with a read prefix, it's likely a read operation returning info
-    if (hasReadPrefix && !name.includes("run") && !name.includes("exec")) {
-      isWrite = false;
+  if (textBlocks.length > 0) {
+    // Share the budget across blocks so the shape of the response is preserved.
+    const perBlock = Math.max(512, Math.floor(limitBytes / textBlocks.length));
+    for (const block of textBlocks) {
+      if (Buffer.byteLength(block.text, "utf8") <= perBlock) continue;
+      block.text =
+        truncateToBytes(block.text, perBlock) +
+        `\n\n... [TRUNCATED BY MCP SHIELD: response exceeded the ${maxPayloadKb} KB limit ` +
+        `(${Math.round(totalBytes / 1024)} KB received). Request a narrower range or a more specific query.]`;
     }
   }
 
-  // Also check inputSchema for clues
-  if (tool.inputSchema && tool.inputSchema.properties) {
-    const props = Object.keys(tool.inputSchema.properties).map(p => p.toLowerCase());
-    // If a tool takes "content", "text", "code", or "value" along with a path/file,
-    // and is not named read_..., it is likely write-capable
-    if ((props.includes("content") || props.includes("text") || props.includes("code") || props.includes("value")) &&
-        !readKeywords.some(kw => name.includes(kw))) {
-      isWrite = true;
-    }
-  }
+  await logWarning(db, {
+    timestamp: Date.now(),
+    server_id: serverId,
+    tool_name: `tools/call response (id: ${msg.id})`,
+    smell_type: "PAYLOAD_LIMIT",
+    description: `Response payload exceeded the configured limit of ${maxPayloadKb} KB.`,
+    details: `Original size ${Math.round(totalBytes / 1024)} KB against a ${maxPayloadKb} KB limit. Truncated to protect the agent's context window from being flooded.`,
+    sanitized: 1,
+  }).catch((err) => console.error(`[MCP Shield] Failed to log warning: ${err.message}`));
 
-  if (isWrite) {
-    capabilities.push("WRITE");
-  } else {
-    capabilities.push("READ");
-  }
-
-  return capabilities;
+  return true;
 }
 
-// Scan tool definitions and sanitize prompt injections
-export function scanAndSanitizeTools(tools: any[], serverId: string, testDb?: any): any[] {
+/** Cut a string to a UTF-8 byte budget without splitting a multi-byte char. */
+function truncateToBytes(text: string, maxBytes: number): string {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= maxBytes) return text;
+  // Decoding a slice can leave a partial code point at the tail; stripping the
+  // replacement character removes it cleanly.
+  return buf.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD+$/, "");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function auditDecision(entry: {
+  toolName: string;
+  argumentsJson: string;
+  decision: "ALLOWED" | "BLOCKED";
+  evaluation: PolicyDecision;
+  method: string;
+}): Promise<number | undefined> {
+  try {
+    return await logAudit(db, {
+      timestamp: Date.now(),
+      server_id: serverId,
+      tool_name: entry.toolName,
+      arguments: entry.argumentsJson,
+      decision: entry.decision,
+      reason: entry.evaluation.reason,
+      risk_score: entry.evaluation.riskScore,
+      findings: entry.evaluation.findings.length
+        ? JSON.stringify(entry.evaluation.findings)
+        : undefined,
+      method: entry.method,
+    });
+  } catch (err: any) {
+    console.error(`[MCP Shield] Failed to write audit entry: ${err.message}`);
+    return undefined;
+  }
+}
+
+/** Record findings that were observed but not enforced (Monitor mode). */
+async function recordFindingWarnings(toolName: string, evaluation: PolicyDecision) {
+  await Promise.all(
+    evaluation.findings.map((finding) =>
+      logWarning(db, {
+        timestamp: Date.now(),
+        server_id: serverId,
+        tool_name: toolName,
+        smell_type: finding.rule === "R-SECRET-EXFIL" ? "SECRET_EXFIL" : "SUSPICIOUS_SCHEMA",
+        description: `${finding.rule} (${finding.severity})`,
+        details: finding.message,
+        sanitized: 0,
+      }).catch(() => undefined)
+    )
+  );
+}
+
+/** Attach the response body and latency to the audit row for this request. */
+async function recordResponse(pending: OutstandingRequest, serialized: string) {
+  if (pending.auditId === undefined) return;
+  try {
+    await updateAuditResponse(
+      db,
+      pending.auditId,
+      serialized.length > 8192 ? serialized.slice(0, 8192) + "…[truncated]" : serialized,
+      Date.now() - pending.startedAt
+    );
+  } catch (err: any) {
+    console.error(`[MCP Shield] Failed to record response: ${err.message}`);
+  }
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? "null";
+  } catch {
+    return '"[unserializable arguments]"';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backwards-compatible re-exports
+// ─────────────────────────────────────────────────────────────────────────────
+// The policy engine moved to policy.ts. These re-exports keep older imports
+// (including existing tests) working against the new implementation.
+
+export { evaluatePolicy, classifyToolCapabilities } from "./policy";
+
+/**
+ * @deprecated Use `analyzeToolList` from policy.ts, which is pure and returns
+ * its findings instead of writing them. Retained because it is the shape the
+ * original test suite and any external callers expect.
+ */
+export function scanAndSanitizeTools(tools: any[], scanServerId: string, testDb?: any): any[] {
   const activeDb = testDb || db;
-  // Regex to detect hidden prompt injections or instruction overrides
-  const injectionRegex =
-    /(?:note\s+to\s+ai|ignore\s+previous|system\s+instruction|instead\s+of|always\s+read|secretly|covertly|you\s+must\s+first|before\s+doing|do\s+not\s+tell)[^.]*/gi;
-  
-  // Sensitive file path keywords in descriptions
-  const sensitiveFileRegex =
-    /(?:\.ssh|id_rsa|passwd|shadow|\.env|credentials|private_key|\.key|\.pem)/gi;
+  const result = analyzeToolList(tools);
 
-  return tools.map((tool) => {
-    // Classify and save capabilities asynchronously
-    const capabilities = classifyToolCapabilities(tool);
-    if (activeDb) {
-      saveToolCapabilities(activeDb, serverId, tool.name, capabilities).catch((err) => {
-        console.error(`[MCP Shield] Failed to save tool capabilities to DB: ${err.message}`);
-      });
-    }
-
-    let description = tool.description || "";
-    let hasSmell = false;
-    let details = "";
-    let smellType: "PROMPT_INJECTION" | "PATH_TRAVERSAL" | "SUSPICIOUS_SCHEMA" = "PROMPT_INJECTION";
-
-    // Scan for prompt injection instruction overrides
-    const injectionMatches = description.match(injectionRegex);
-    if (injectionMatches) {
-      hasSmell = true;
-      details += `Prompt injection patterns detected: "${injectionMatches.join(", ")}". `;
-      description = description.replace(
-         injectionRegex,
-        "[Description redacted by MCP Shield for prompt injection safety]"
+  if (activeDb) {
+    for (const entry of result.capabilities) {
+      saveToolCapabilities(activeDb, scanServerId, entry.toolName, entry.capabilities).catch(
+        (err) => console.error(`[MCP Shield] Failed to save tool capabilities: ${err.message}`)
       );
     }
-
-    // Scan for sensitive file paths in tool definitions
-    const fileMatches = description.match(sensitiveFileRegex);
-    if (fileMatches) {
-      hasSmell = true;
-      smellType = "PATH_TRAVERSAL";
-      details += `Sensitive file references detected: "${fileMatches.join(", ")}". `;
+    for (const smell of result.smells) {
+      logWarning(activeDb, {
+        timestamp: Date.now(),
+        server_id: scanServerId,
+        tool_name: smell.toolName,
+        smell_type: smell.smellType,
+        description: smell.originalDescription,
+        details: smell.details,
+        sanitized: 1,
+      }).catch((err) => console.error(`[MCP Shield] Failed to log warning: ${err.message}`));
     }
+  }
 
-    if (hasSmell) {
-      // Log warning to SQLite async if DB is active
-      if (activeDb) {
-        logWarning(activeDb, {
-          timestamp: Date.now(),
-          server_id: serverId,
-          tool_name: tool.name,
-          smell_type: smellType,
-          description: tool.description || "",
-          details: details.trim(),
-          sanitized: 1,
-        }).catch((err) => {
-          // Console error goes to stderr so it does not pollute stdout JSON-RPC stream
-          console.error(`[MCP Shield] Failed to log warning to DB: ${err.message}`);
-        });
-      }
-
-      return {
-        ...tool,
-        description: description,
-      };
-    }
-
-    return tool;
-  });
+  return result.tools;
 }
 
-// Start Proxy
 if (!isTesting) {
   start();
 }
