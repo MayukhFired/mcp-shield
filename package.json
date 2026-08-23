@@ -92,7 +92,8 @@
   "scripts": {
     "vscode:prepublish": "npm run build -- --production",
     "compile": "tsc -p ./",
-    "typecheck": "tsc -p ./ --noEmit",
+    "typecheck": "tsc -p ./tsconfig.test.json",
+    "verify": "npm run typecheck && npm run build && npm test",
     "watch": "node esbuild.js --watch",
     "build": "node esbuild.js",
     "test": "jest",

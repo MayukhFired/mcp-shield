@@ -1,0 +1,44 @@
+{
+  // F5 debugging. The repo previously had no launch config, so there was no way
+  // to run the extension without packaging and installing it.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "npm: build"
+    },
+    {
+      // Attaches to the stdio gateway. Note that in normal operation the gateway
+      // is spawned by the MCP client, not by VS Code, so this is for running it
+      // by hand against a target server.
+      "name": "Debug stdio Gateway (manual)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/dist/gateway.js",
+      "args": [
+        "--server",
+        "debug",
+        "--db",
+        "${workspaceFolder}/mcp-shield.db",
+        "--",
+        "node",
+        "${workspaceFolder}/resources/demo-evil-server.js"
+      ],
+      "console": "integratedTerminal",
+      "preLaunchTask": "npm: build"
+    },
+    {
+      "name": "Debug Jest Tests",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/jest/bin/jest.js",
+      "args": ["--runInBand"],
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen"
+    }
+  ]
+}

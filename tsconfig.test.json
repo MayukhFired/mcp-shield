@@ -1,0 +1,15 @@
+{
+  // The main tsconfig.json restricts `include` to src/** with rootDir: "src",
+  // which meant the test suite was never type-checked by `npm run compile` —
+  // type errors in tests only surfaced when ts-jest happened to hit them.
+  //
+  // This config type-checks sources and tests together without emitting, so
+  // `npm run typecheck` covers the whole repository.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node", "jest"]
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}

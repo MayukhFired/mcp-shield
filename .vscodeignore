@@ -1,0 +1,41 @@
+# Files excluded from the packaged .vsix.
+#
+# IMPORTANT: node_modules is deliberately NOT excluded.
+#
+# `sqlite3` is a native module and both it and its `sqlite` promise wrapper are
+# marked `external` in esbuild.js, so they are resolved from node_modules at
+# runtime rather than bundled. The stdio gateway is spawned by the MCP *client*
+# as a standalone Node process, so it must be able to `require("sqlite3")` from
+# inside the installed extension directory. Excluding node_modules produces an
+# extension that installs cleanly and then fails the moment a server is shielded.
+#
+# vsce already omits devDependencies, so only the two runtime deps ship.
+
+# Sources — the bundles in dist/ are what actually run.
+src/**
+tests/**
+
+# Build and tooling config
+tsconfig.json
+tsconfig.test.json
+esbuild.js
+jest.config.js
+.github/**
+.vscode/**
+.gitignore
+.vscodeignore
+
+# Source maps roughly double the package size and are not useful to end users.
+# Remove this line if you want stack traces from user reports to be readable.
+dist/**/*.map
+
+# Local artifacts
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.bak
+**/.DS_Store
+
+# Documentation kept in the package: README and LICENSE are shown on the
+# Marketplace page, so they are intentionally not ignored here.
+docs/PRESENTATION.md
